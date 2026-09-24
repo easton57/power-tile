@@ -18,11 +18,14 @@
         Alt+[ / Alt+]   Shrink / grow the master area
         Alt+Q           Close focused window
         Alt+Shift+Space Toggle floating (exclude/include from tiling)
+        Alt+Shift+F     Bring floating windows (on the active workspace) to the front
         Alt+Shift+R     Force re-tile
         Alt+Shift+E     Quit
         Alt+1..9        Switch to workspace 1-9 (fake/virtual desktops)
         Alt+Shift+1..9  Move focused window to workspace 1-9
-        Alt+Space       Open the app launcher (fuzzy-search installed apps, Enter to run)
+        Ctrl+Shift+Space  Open the app launcher (fuzzy-search installed apps, Enter to run)
+        Ctrl+Shift+R      Restart (relaunch fresh - picks up script/config edits without
+                          logging out; workspace assignments/ratios are preserved)
 
     Focus follows mouse is on by default (hover a tiled window to focus it, no
     click needed) - set FocusFollowsMouse = $false in the config to disable it.
@@ -31,7 +34,7 @@
     (name -> @{ Key = 'Alt+Shift+Enter'; Path = 'wt.exe' }) to bind hotkeys that
     launch programs. None are bound by default; see the sample config for examples.
 
-    A tray icon is shown while running; right-click it for "Retile now" / "Exit".
+    A tray icon is shown while running; right-click it for "Retile now" / "Restart" / "Exit".
     A status bar across the top of the primary monitor lists which apps are open
     on each workspace (1-9), highlighting the active one - set ShowStatusBar =
     $false in the config to disable it. Set HideTaskbar = $true to also hide the
@@ -94,8 +97,14 @@ $script:DefaultConfig = @{
     StatusBarBusyColor     = '#3C3C3C'
     StatusBarTextColor     = '#FFFFFF'
     StatusBarIdleTextColor = '#808080'
-    ExcludedProcesses  = @('explorer', 'ShellExperienceHost', 'SearchHost', 'StartMenuExperienceHost', 'TextInputHost', 'SystemSettings')
+    ExcludedProcesses  = @('ShellExperienceHost', 'SearchHost', 'StartMenuExperienceHost', 'TextInputHost', 'SystemSettings')
     ExcludedClasses    = @('Shell_TrayWnd', 'Shell_SecondaryTrayWnd', 'Progman', 'WorkerW', 'Windows.UI.Core.CoreWindow', 'MultitaskingViewFrame')
+    # Windows matching these (by process name or window class) are never hidden for being on
+    # an inactive workspace - use this for a chat/call app's notification popup if it isn't
+    # already caught automatically (any WS_EX_TOPMOST window gets this treatment for free,
+    # which covers most incoming-call/alert popups without needing to list anything here).
+    AlwaysVisibleProcesses = @()
+    AlwaysVisibleClasses   = @()
     # name -> @{ Key = 'Alt+Shift+Enter'; Path = 'wt.exe'; Arguments = '' (optional) }
     AppShortcuts       = @{}
     HotKeys            = @{
@@ -112,9 +121,17 @@ $script:DefaultConfig = @{
         GrowMaster     = 'Alt+]'
         CloseWindow    = 'Alt+Q'
         ToggleFloating = 'Alt+Shift+Space'
+        FloatingToFront = 'Alt+Shift+F'
         Retile         = 'Alt+Shift+R'
         Quit           = 'Alt+Shift+E'
-        AppLauncher    = 'Alt+Space'
+        # Deliberately not an Alt+ combo - Office apps (Outlook, OneNote, etc.) grab the Alt
+        # key for their Ribbon "KeyTips" overlay, which unreliably swallows Alt-chords before
+        # they ever reach this app's global hotkey while one of those windows has focus.
+        AppLauncher    = 'Ctrl+Shift+Space'
+        # Same reasoning as AppLauncher above, plus it mirrors the browser "hard refresh"
+        # convention - relaunches a fresh instance so an autostarted WM can pick up script/
+        # config edits without logging out, no Alt-chord collision risk either.
+        Restart        = 'Ctrl+Shift+R'
     }
 }
 
@@ -209,6 +226,9 @@ public class Win32
     [DllImport("user32.dll")]
     public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
 
+    [DllImport("user32.dll")]
+    public static extern short GetAsyncKeyState(int vKey);
+
     [DllImport("kernel32.dll")]
     public static extern uint GetCurrentThreadId();
 
@@ -231,9 +251,20 @@ public class Win32
         {
             const byte VK_MENU = 0x12;
             const uint KEYEVENTF_KEYUP = 0x2;
+            // The fake down+up below is what actually earns permission to steal focus (Windows
+            // grants SetForegroundWindow to whichever process last "generated" an input event) -
+            // it must always be sent, even if Alt happens to already be down for real, or the
+            // popup just flashes in and gets deactivated/closed immediately (no focus granted).
             keybd_event(VK_MENU, 0, 0, UIntPtr.Zero);
             SetForegroundWindow(hWnd);
             keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
+            // This normally runs from an Alt+<key> global hotkey (e.g. the app launcher's
+            // Alt+Space), where the real Alt key is very likely still physically held down at
+            // this exact moment - the fake "up" just told Windows Alt was released while the
+            // physical key remains down, which can make the *next* Alt-chord hotkey misfire.
+            // Re-assert a synthetic Alt-down to correct that; its matching "up" comes for free
+            // once the user actually releases the real key.
+            if ((GetAsyncKeyState(VK_MENU) & 0x8000) != 0) { keybd_event(VK_MENU, 0, 0, UIntPtr.Zero); }
         }
         finally
         {
@@ -290,6 +321,17 @@ public class Win32
         GetClassName(hWnd, sb, sb.Capacity);
         return sb.ToString();
     }
+
+    public delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
+
+    // WINEVENT_OUTOFCONTEXT (dwFlags=0) delivers callbacks synchronously on the calling
+    // thread's message pump - no DLL injection into other processes needed, and no
+    // cross-thread marshaling to worry about on the PowerShell side.
+    [DllImport("user32.dll")]
+    public static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr hmodWinEventProc, WinEventDelegate lpfnWinEventProc, uint idProcess, uint idThread, uint dwFlags);
+
+    [DllImport("user32.dll")]
+    public static extern bool UnhookWinEvent(IntPtr hWinEventHook);
 }
 
 // Hidden message-only-style window used purely to receive WM_HOTKEY messages
@@ -347,6 +389,8 @@ $script:FloatingWindows = New-Object 'System.Collections.Generic.HashSet[IntPtr]
 $script:HotKeyActions = @{}     # hotkey id -> action name
 $script:HotKeyWindowHandle = [IntPtr]::Zero
 $script:WindowWorkspace = @{}   # hwnd -> workspace number, remembered even while hidden
+$script:LastWindowVisible = @{} # hwnd -> was it visible on the previous poll (Outlook dismiss-detection)
+$script:DismissedWindows = New-Object 'System.Collections.Generic.HashSet[IntPtr]' # Outlook singleton popups the user closed - never re-show
 $script:ActiveWorkspace = 1
 $script:WorkspaceMasterRatio = @{} # "workspace|MonitorKey" -> master ratio override, falls back to Config.MasterRatio
 $script:TrayIconHandle = [IntPtr]::Zero # native HICON backing the tray workspace badge
@@ -362,7 +406,10 @@ $script:StatusBarBatteryLabel = $null # top-of-screen battery % label (only when
 # ---------------------------------------------------------------------------
 
 function Test-ManageableWindow {
-    param([IntPtr]$Hwnd)
+    # $ProcCache is an optional pid -> process-name lookup reused across every window checked
+    # within a single Update-WindowSets pass, so multi-window apps (browsers, Explorer, etc.)
+    # only cost one Get-Process call per poll instead of one per window.
+    param([IntPtr]$Hwnd, [hashtable]$ProcCache)
 
     if ($Hwnd -eq $script:HotKeyWindowHandle) { return $false }
     if ($script:FloatingWindows.Contains($Hwnd)) { return $false }
@@ -385,14 +432,51 @@ function Test-ManageableWindow {
 
     $procId = 0
     [Win32]::GetWindowThreadProcessId($Hwnd, [ref]$procId) | Out-Null
-    try {
-        $procName = (Get-Process -Id $procId -ErrorAction Stop).ProcessName
-    } catch {
-        $procName = $null
+    if ($ProcCache -and $ProcCache.ContainsKey($procId)) {
+        $procName = $ProcCache[$procId]
+    } else {
+        try {
+            $procName = (Get-Process -Id $procId -ErrorAction Stop).ProcessName
+        } catch {
+            $procName = $null
+        }
+        if ($ProcCache) { $ProcCache[$procId] = $procName }
     }
     if ($procName -and ($script:Config.ExcludedProcesses -contains $procName)) { return $false }
 
     return $true
+}
+
+function Test-AlwaysVisibleWindow {
+    # Chat/calling apps (Teams, Slack, Zoom, Discord...) commonly reuse one hidden hwnd for
+    # their incoming-call/notification popup across the app's whole lifetime instead of
+    # creating a fresh one each time - once that hwnd gets tracked to whatever workspace
+    # happened to be active the first time it appeared, every later poll would just hide it
+    # again if a different workspace is active, silently swallowing the alert (missed calls).
+    # WS_EX_TOPMOST is the vendor-agnostic signal these always use for exactly this kind of
+    # transient always-on-top alert, so it's treated as "never hide this for a workspace
+    # switch" by default; AlwaysVisibleProcesses/AlwaysVisibleClasses cover anything that
+    # doesn't set it.
+    param([IntPtr]$Hwnd, [hashtable]$ProcCache)
+
+    $exStyle = [Win32]::GetWindowLong($Hwnd, -20) # GWL_EXSTYLE
+    if (($exStyle -band 0x00000008) -ne 0) { return $true } # WS_EX_TOPMOST
+
+    if ($script:Config.AlwaysVisibleClasses -and $script:Config.AlwaysVisibleClasses.Count -gt 0) {
+        if ($script:Config.AlwaysVisibleClasses -contains [Win32]::GetClass($Hwnd)) { return $true }
+    }
+    if ($script:Config.AlwaysVisibleProcesses -and $script:Config.AlwaysVisibleProcesses.Count -gt 0) {
+        $procId = 0
+        [Win32]::GetWindowThreadProcessId($Hwnd, [ref]$procId) | Out-Null
+        if ($ProcCache -and $ProcCache.ContainsKey($procId)) {
+            $procName = $ProcCache[$procId]
+        } else {
+            try { $procName = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch { $procName = $null }
+            if ($ProcCache) { $ProcCache[$procId] = $procName }
+        }
+        if ($procName -and ($script:Config.AlwaysVisibleProcesses -contains $procName)) { return $true }
+    }
+    return $false
 }
 
 # ---------------------------------------------------------------------------
@@ -453,9 +537,43 @@ function Update-WindowSets {
 
     $allHwnds = [Win32]::GetTopLevelWindows()
     $byMonitor = @{}
+    $procNameCache = @{} # pid -> process name, scoped to this single pass - see Test-ManageableWindow
 
     foreach ($hwnd in $allHwnds) {
         if ($hwnd -eq $script:HotKeyWindowHandle) { continue }
+        # Outlook (classic) sometimes leaves behind a blank/titleless top-level frame - its
+        # rctrl_renwnd32 window class is reused by both the Explorer and Inspector windows - after
+        # a window is closed. Since it has no title, it would otherwise fall through the checks
+        # below untracked: never assigned to a workspace, so workspace switches never hide it, and
+        # it just sits there as a permanent "ghost" no matter how many times it's closed. Suppress
+        # it outright instead.
+        if ([Win32]::IsWindowVisible($hwnd) -and [Win32]::GetWindowTextLength($hwnd) -eq 0 -and [Win32]::GetClass($hwnd) -eq 'rctrl_renwnd32') {
+            [Win32]::ShowWindow($hwnd, 0) | Out-Null # SW_HIDE
+            continue
+        }
+        # Outlook's reminder dialog (#32770) and Inspector windows (rctrl_renwnd32 - a compose
+        # or read window) are singleton-ish: Outlook just hides the hwnd instead of destroying it
+        # when the user dismisses/closes it. Without this, Switch-Workspace's own "show windows
+        # tagged to this workspace" logic re-shows that very same hwnd next time the user returns
+        # to this workspace, making a dismissed reminder/compose window look like it "reopens
+        # itself". Detect the visible -> hidden transition happening on its own (i.e. not because
+        # *we* just hid it for an outgoing workspace) and stop showing that window for good.
+        $isOutlookSingleton = @('#32770', 'rctrl_renwnd32') -contains [Win32]::GetClass($hwnd)
+        if ($isOutlookSingleton -and $script:WindowWorkspace.ContainsKey($hwnd) -and $script:WindowWorkspace[$hwnd] -eq $script:ActiveWorkspace) {
+            $procId = 0
+            [Win32]::GetWindowThreadProcessId($hwnd, [ref]$procId) | Out-Null
+            $isOutlookProc = $false
+            try { $isOutlookProc = (Get-Process -Id $procId -ErrorAction Stop).ProcessName -eq 'OUTLOOK' } catch { }
+            $visibleNow = [Win32]::IsWindowVisible($hwnd)
+            if ($isOutlookProc -and $script:LastWindowVisible.ContainsKey($hwnd) -and $script:LastWindowVisible[$hwnd] -and -not $visibleNow) {
+                [void]$script:DismissedWindows.Add($hwnd)
+            }
+            $script:LastWindowVisible[$hwnd] = $visibleNow
+        }
+        if ($script:DismissedWindows.Contains($hwnd)) {
+            if ([Win32]::IsWindowVisible($hwnd)) { [Win32]::ShowWindow($hwnd, 0) | Out-Null } # SW_HIDE
+            continue
+        }
         # Track workspace membership for any real window, even ones excluded from tiling
         # (floating/other-workspace), so hide/show on workspace switch still works for them.
         if (-not $script:WindowWorkspace.ContainsKey($hwnd) -and [Win32]::IsWindowVisible($hwnd) -and [Win32]::GetWindowTextLength($hwnd) -gt 0) {
@@ -463,11 +581,16 @@ function Update-WindowSets {
         }
         # Some apps (e.g. Outlook reminder popups) re-show their own window on a timer,
         # bypassing the one-time hide from Switch-Workspace - re-suppress it every poll.
+        # Exception: always-visible windows (WS_EX_TOPMOST alerts, or an AlwaysVisible*
+        # config match) are left alone here - an app choosing to show one of these while
+        # a different workspace is active is exactly the "incoming call" case that should
+        # stay on screen rather than get silently hidden again.
         if ($script:WindowWorkspace.ContainsKey($hwnd) -and $script:WindowWorkspace[$hwnd] -ne $script:ActiveWorkspace) {
+            if (Test-AlwaysVisibleWindow -Hwnd $hwnd -ProcCache $procNameCache) { continue }
             if ([Win32]::IsWindowVisible($hwnd)) { [Win32]::ShowWindow($hwnd, 0) | Out-Null } # SW_HIDE
             continue
         }
-        if (-not (Test-ManageableWindow -Hwnd $hwnd)) { continue }
+        if (-not (Test-ManageableWindow -Hwnd $hwnd -ProcCache $procNameCache)) { continue }
         $screen = [System.Windows.Forms.Screen]::FromHandle($hwnd)
         $key = $screen.DeviceName
         if (-not $byMonitor.ContainsKey($key)) { $byMonitor[$key] = New-Object 'System.Collections.Generic.List[IntPtr]' }
@@ -476,6 +599,15 @@ function Update-WindowSets {
 
     foreach ($hwnd in @($script:WindowWorkspace.Keys)) {
         if ($allHwnds -notcontains $hwnd) { $script:WindowWorkspace.Remove($hwnd) }
+    }
+    # Purge bookkeeping for any hwnd that's been fully destroyed, not just hidden, so a genuinely
+    # new window (a fresh Outlook reminder/compose instance reusing a recycled-looking title) isn't
+    # mistaken for one already marked dismissed, and these dictionaries don't grow unbounded.
+    foreach ($hwnd in @($script:LastWindowVisible.Keys)) {
+        if ($allHwnds -notcontains $hwnd) { $script:LastWindowVisible.Remove($hwnd) }
+    }
+    foreach ($hwnd in @($script:DismissedWindows)) {
+        if ($allHwnds -notcontains $hwnd) { [void]$script:DismissedWindows.Remove($hwnd) }
     }
 
     $changed = $Force.IsPresent
@@ -544,7 +676,13 @@ function Invoke-FocusFollowsMouseTick {
     # taskbar/tray/desktop/floating windows can't yank focus unexpectedly.
     foreach ($list in $script:ManagedWindows.Values) {
         if ($list.Contains($hwnd)) {
-            [Win32]::SetForegroundWindow($hwnd) | Out-Null
+            # Plain SetForegroundWindow from this background timer almost always just flashes
+            # the taskbar entry instead of actually focusing anything - Windows only grants
+            # foreground to a process that itself "generated" the last input event, and polling
+            # GetCursorPos doesn't count (this is the same restriction ForceForegroundWindow
+            # already works around for the app launcher; it wasn't applied here before, which is
+            # why focus-follows-mouse only worked by chance).
+            [Win32]::ForceForegroundWindow($hwnd)
             return
         }
     }
@@ -662,8 +800,39 @@ function Invoke-ToggleFloating {
     Update-WindowSets -Force
 }
 
+function Invoke-BringFloatingToFront {
+    # Floating windows keep whatever z-order they last had (tiled windows are repositioned
+    # with SWP_NOZORDER so they never disturb it), so a floating window can end up buried
+    # behind tiled ones after a focus change elsewhere. Raise every floating window tracked
+    # on the active workspace back above everything else, without stealing focus.
+    $flags = 0x0001 -bor 0x0002 -bor 0x0010 # SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+    $topHwnd = [IntPtr]::Zero
+    foreach ($hwnd in $script:FloatingWindows) {
+        if (-not [Win32]::IsWindowVisible($hwnd)) { continue }
+        if ($script:WindowWorkspace.ContainsKey($hwnd) -and $script:WindowWorkspace[$hwnd] -ne $script:ActiveWorkspace) { continue }
+        [Win32]::SetWindowPos($hwnd, [IntPtr]::Zero, 0, 0, 0, 0, $flags) | Out-Null # HWND_TOP
+        $topHwnd = $hwnd
+    }
+    if ($topHwnd -ne [IntPtr]::Zero) { [Win32]::SetForegroundWindow($topHwnd) | Out-Null }
+}
+
 function Invoke-Quit {
     [System.Windows.Forms.Application]::Exit()
+}
+
+function Invoke-Restart {
+    # Relaunches a fresh instance of this same script (picking up any edits to it or to
+    # TilingWM.config.psd1) and exits this one - workspace assignments/ratios survive the
+    # handoff via Save-TilingWMState/Restore-TilingWMState, same as a normal clean exit.
+    Write-Log "Restarting..." -Level Info
+    try {
+        $exePath = (Get-Process -Id $PID).Path
+        Start-Process -FilePath $exePath -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+    } catch {
+        Write-Log "Failed to relaunch for restart: $_"
+        return
+    }
+    Invoke-Quit
 }
 
 function Set-TaskbarVisible {
@@ -696,7 +865,7 @@ function Invoke-LaunchApp {
 }
 
 # ---------------------------------------------------------------------------
-# App launcher (Alt+Space fuzzy finder over installed apps - Get-StartApps
+# App launcher (Ctrl+Shift+Space fuzzy finder over installed apps - Get-StartApps
 # covers both classic Win32 shortcuts and Store/UWP apps in one call).
 # ---------------------------------------------------------------------------
 
@@ -1148,6 +1317,24 @@ function Set-TrayWorkspaceIcon {
     $script:TrayIconHandle = $hIcon
 }
 
+function Invoke-DelayedRelayout {
+    # A window just un-hidden via SW_SHOWNA sometimes doesn't accept the SetWindowPos we
+    # apply in the same tick - a suspended/backgrounded UWP app resuming, or an Electron/WPF
+    # app re-asserting its own remembered position a moment after being shown - so windows
+    # sent to (or already waiting on) a workspace can land stacked on top of each other and
+    # stay that way until manually dragged apart. A short follow-up pass re-applies the tile
+    # layout once things have settled, without needing the user to force a retile themselves.
+    param([int]$DelayMs = 250)
+    $t = New-Object System.Windows.Forms.Timer
+    $t.Interval = $DelayMs
+    $t.add_Tick({
+            param($sender, $e)
+            try { Update-WindowSets -Force } catch { Write-Log "Delayed relayout failed: $_" }
+            $sender.Stop(); $sender.Dispose()
+        })
+    $t.Start()
+}
+
 function Switch-Workspace {
     # Fakes virtual desktops: hides windows on the outgoing workspace, shows the incoming one.
     param([int]$Workspace)
@@ -1156,8 +1343,11 @@ function Switch-Workspace {
     foreach ($hwnd in @($script:WindowWorkspace.Keys)) {
         $ws = $script:WindowWorkspace[$hwnd]
         if ($ws -eq $script:ActiveWorkspace) {
+            # Don't hide an always-visible alert (e.g. an incoming-call toast) just because
+            # we're leaving the workspace it happens to be tagged to - see Test-AlwaysVisibleWindow.
+            if (Test-AlwaysVisibleWindow -Hwnd $hwnd) { continue }
             [Win32]::ShowWindow($hwnd, 0) | Out-Null # SW_HIDE
-        } elseif ($ws -eq $Workspace) {
+        } elseif ($ws -eq $Workspace -and -not $script:DismissedWindows.Contains($hwnd)) {
             [Win32]::ShowWindow($hwnd, 8) | Out-Null # SW_SHOWNA (no activation)
         }
     }
@@ -1169,6 +1359,7 @@ function Switch-Workspace {
 
     $any = $script:ManagedWindows.Values | Where-Object { $_.Count -gt 0 } | Select-Object -First 1
     if ($any) { [Win32]::SetForegroundWindow($any[0]) | Out-Null }
+    Invoke-DelayedRelayout
     Write-Log "Workspace $Workspace" -Level Info
 }
 
@@ -1184,6 +1375,7 @@ function Move-FocusedWindowToWorkspace {
     }
     Update-WindowSets -Force
     Update-StatusBarContent
+    Invoke-DelayedRelayout
 }
 
 # ---------------------------------------------------------------------------
@@ -1373,9 +1565,11 @@ $hotkeyWindow.add_HotKeyPressed({
                 'GrowMaster' { Invoke-ResizeMaster -Delta 0.05 }
                 'CloseWindow' { Invoke-CloseFocusedWindow }
                 'ToggleFloating' { Invoke-ToggleFloating }
+                'FloatingToFront' { Invoke-BringFloatingToFront }
                 'Retile' { Update-WindowSets -Force }
                 'Quit' { Invoke-Quit }
                 'AppLauncher' { Show-AppLauncher }
+                'Restart' { Invoke-Restart }
             }
         } catch { Write-Log "Hotkey action '$action' failed: $_" }
     })
@@ -1384,6 +1578,7 @@ $trayIcon = New-Object System.Windows.Forms.NotifyIcon
 $trayIcon.Visible = $true
 $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
 [void]$trayMenu.Items.Add('Retile now', $null, { try { Update-WindowSets -Force } catch { Write-Log "Retile now failed: $_" } })
+[void]$trayMenu.Items.Add('Restart', $null, { try { Invoke-Restart } catch { Write-Log "Restart failed: $_" } })
 [void]$trayMenu.Items.Add('Exit', $null, { try { Invoke-Quit } catch { Write-Log "Exit failed: $_" } })
 $trayIcon.ContextMenuStrip = $trayMenu
 Set-TrayWorkspaceIcon -Workspace $script:ActiveWorkspace
@@ -1413,6 +1608,26 @@ $statusBarHoverTimer.add_Tick({
     try { Invoke-StatusBarHoverTick } catch { Write-Log "Invoke-StatusBarHoverTick failed: $_" }
 })
 
+# Fires the instant the user finishes dragging/resizing ANY top-level window (mouse-up after
+# a title-bar drag or border resize) - snaps a tiled window straight back into its grid slot
+# instead of leaving it wherever it was dropped until the next poll or a manual Alt+Shift+R.
+# WINEVENT_OUTOFCONTEXT (dwFlags=0) delivers this callback synchronously on this same thread's
+# message pump, so touching $script:-scoped state from it is safe.
+$script:MoveSizeEndProc = {
+    param($hWinEventHook, $eventType, $hwnd, $idObject, $idChild, $dwEventThread, $dwmsEventTime)
+    try {
+        if ($idObject -ne 0 -or $hwnd -eq [IntPtr]::Zero) { return } # OBJID_WINDOW only
+        foreach ($key in @($script:ManagedWindows.Keys)) {
+            if ($script:ManagedWindows[$key].Contains($hwnd)) {
+                Set-MonitorLayout -MonitorKey $key
+                break
+            }
+        }
+    } catch { Write-Log "MoveSizeEnd hook failed: $_" }
+}
+# EVENT_SYSTEM_MOVESIZEEND = 0x000B for both eventMin/eventMax - only that one event.
+$script:MoveSizeEndHook = [Win32]::SetWinEventHook(0x000B, 0x000B, [IntPtr]::Zero, $script:MoveSizeEndProc, 0, 0, 0)
+
 Update-WindowSets -Force
 Update-StatusBarContent
 $timer.Start()
@@ -1431,6 +1646,7 @@ try {
     $mouseTimer.Dispose()
     $statusBarHoverTimer.Stop()
     $statusBarHoverTimer.Dispose()
+    if ($script:MoveSizeEndHook -and $script:MoveSizeEndHook -ne [IntPtr]::Zero) { [Win32]::UnhookWinEvent($script:MoveSizeEndHook) | Out-Null }
     # Un-hide anything parked on an inactive fake workspace so it can't be stranded when we quit.
     foreach ($hwnd in $script:WindowWorkspace.Keys) {
         [Win32]::ShowWindow($hwnd, 8) | Out-Null # SW_SHOWNA

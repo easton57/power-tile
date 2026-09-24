@@ -26,7 +26,6 @@
     StatusBarIdleTextColor = '#808080'  # text on empty workspace slots
 
     ExcludedProcesses  = @(
-        'explorer'
         'ShellExperienceHost'
         'SearchHost'
         'StartMenuExperienceHost'
@@ -43,6 +42,14 @@
         'MultitaskingViewFrame'
     )
 
+    # Windows matching these (by process name or window class) are never hidden just for
+    # being on an inactive workspace - e.g. a chat/call app's incoming-call or notification
+    # popup, so it can't get silently swallowed while you're on a different workspace.
+    # Any WS_EX_TOPMOST window already gets this treatment automatically (covers most
+    # incoming-call/alert popups), so these lists are only needed for ones that aren't.
+    AlwaysVisibleProcesses = @()
+    AlwaysVisibleClasses   = @()
+
     HotKeys            = @{
         FocusLeft      = 'Alt+H'
         FocusDown      = 'Alt+J'
@@ -57,9 +64,14 @@
         GrowMaster     = 'Alt+]'
         CloseWindow    = 'Alt+Q'
         ToggleFloating = 'Alt+Shift+Space'
+        FloatingToFront = 'Alt+Shift+F'   # raise floating windows on this workspace above tiled ones
         Retile         = 'Alt+Shift+R'
         Quit           = 'Alt+Shift+E'
-        AppLauncher    = 'Alt+Space'   # fuzzy-search installed apps, Enter to run
+        # Not an Alt+ combo on purpose - Office apps (Outlook, OneNote, etc.) grab Alt for
+        # their Ribbon "KeyTips" overlay (the floating letters/numbers), which unreliably
+        # swallows Alt-chords before they reach this app's global hotkey while focused.
+        AppLauncher    = 'Ctrl+Shift+Space'   # fuzzy-search installed apps, Enter to run
+        Restart        = 'Ctrl+Shift+R'   # relaunch fresh - picks up script/config edits without logging out
 
         # Workspace1-9 switches to that (fake/virtual) workspace; MoveToWorkspaceN
         # moves the focused window there. Windows on inactive workspaces are hidden.
