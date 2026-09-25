@@ -375,6 +375,15 @@ public class HotKeyWindow : Form
         base.WndProc(ref m);
     }
 }
+
+public class ClickThroughOverlayForm : Form
+{
+    protected override void WndProc(ref Message m)
+    {
+        base.WndProc(ref m);
+        if (m.Msg == 0x0084) m.Result = (IntPtr)(-1); // WM_NCHITTEST / HTTRANSPARENT
+    }
+}
 '@
 }
 
@@ -393,6 +402,7 @@ $script:LastWindowVisible = @{} # hwnd -> was it visible on the previous poll (O
 $script:DismissedWindows = New-Object 'System.Collections.Generic.HashSet[IntPtr]' # Outlook singleton popups the user closed - never re-show
 $script:ActiveWorkspace = 1
 $script:WorkspaceMasterRatio = @{} # "workspace|MonitorKey" -> master ratio override, falls back to Config.MasterRatio
+$script:LastMousePos = $null # last-seen cursor position, so focus-follows-mouse only reacts to actual movement
 $script:TrayIconHandle = [IntPtr]::Zero # native HICON backing the tray workspace badge
 $script:StatusBarForm = $null   # top-of-screen form listing apps per workspace
 $script:StatusBarLabels = @{}   # workspace number -> Label control inside the status bar
@@ -669,6 +679,15 @@ function Invoke-FocusFollowsMouseTick {
     # shown/activated and steals focus back to whatever tiled window is under the cursor,
     # which triggers the launcher's Deactivate handler and closes it immediately.
     if ($script:AppLauncherForm -and -not $script:AppLauncherForm.IsDisposed) { return }
+    $pos = [System.Windows.Forms.Cursor]::Position
+    # Without this, a stationary cursor resting over some other tiled window (top-right
+    # corner, wherever) would still re-force focus to it every single tick, fighting any
+    # focus change made another way (a hotkey, Alt-Tab, clicking a taskbar entry) within
+    # 100ms of it happening - this is what "the top right of the screen unfocuses my
+    # window" actually was: it wasn't specific to that corner, just wherever the mouse
+    # happened to be idling. Only act when the cursor has actually moved since last tick.
+    if ($script:LastMousePos -and $pos.X -eq $script:LastMousePos.X -and $pos.Y -eq $script:LastMousePos.Y) { return }
+    $script:LastMousePos = $pos
     $hwnd = [Win32]::GetTopLevelWindowAtCursor()
     if ($hwnd -eq [IntPtr]::Zero) { return }
     if ($hwnd -eq [Win32]::GetForegroundWindow()) { return }
@@ -965,7 +984,7 @@ function Show-AppLauncher {
     }
     $script:AppLauncherTheme = $theme
 
-    $form = New-Object System.Windows.Forms.Form
+    $form = New-Object ClickThroughOverlayForm
     $form.FormBorderStyle = 'None'
     $form.StartPosition = 'Manual'
     $form.ShowInTaskbar = $false
@@ -1136,10 +1155,13 @@ function Initialize-StatusBar {
     }
 
     # Force handle creation so we can mark it non-activating before it's ever shown -
-    # otherwise Show() would steal the foreground from whatever the user was using.
+    # otherwise Show() would steal the foreground from whatever the user was using. Also
+    # ClickThroughOverlayForm returns HTTRANSPARENT for every hit test, so pointer input reaches
+    # the window underneath, including through the visible clock/battery text in the top-right.
+    # WS_EX_TRANSPARENT also preserves the intended transparent-overlay paint ordering.
     [void]$form.Handle
     $exStyle = [Win32]::GetWindowLong($form.Handle, -20) # GWL_EXSTYLE
-    $exStyle = $exStyle -bor 0x08000000 -bor 0x00000080  # WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+    $exStyle = $exStyle -bor 0x08000000 -bor 0x00000080 -bor 0x00000020  # WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT
     [Win32]::SetWindowLong($form.Handle, -20, $exStyle) | Out-Null
 
     $script:StatusBarClockLabel = $null
@@ -1628,6 +1650,23 @@ $script:MoveSizeEndProc = {
 # EVENT_SYSTEM_MOVESIZEEND = 0x000B for both eventMin/eventMax - only that one event.
 $script:MoveSizeEndHook = [Win32]::SetWinEventHook(0x000B, 0x000B, [IntPtr]::Zero, $script:MoveSizeEndProc, 0, 0, 0)
 
+# TEMPORARY diagnostic for the "top-right deadzone" report - logs every system-wide foreground
+# change (millisecond timestamp + hwnd/class/title/process) so a repro can be matched up against
+# what actually stole/ate focus. Safe to remove once root-caused; harmless otherwise.
+$script:ForegroundChangeProc = {
+    param($hWinEventHook, $eventType, $hwnd, $idObject, $idChild, $dwEventThread, $dwmsEventTime)
+    try {
+        if ($idObject -ne 0 -or $hwnd -eq [IntPtr]::Zero) { return } # OBJID_WINDOW only
+        $procId = 0
+        [Win32]::GetWindowThreadProcessId($hwnd, [ref]$procId) | Out-Null
+        try { $procName = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch { $procName = '?' }
+        $ts = Get-Date -Format 'HH:mm:ss.fff'
+        Write-Log "[$ts] FG-> hwnd=$hwnd class=$([Win32]::GetClass($hwnd)) title='$([Win32]::GetTitle($hwnd))' proc=$procName" -Level Info
+    } catch { Write-Log "Foreground-change diagnostic hook failed: $_" }
+}
+# EVENT_SYSTEM_FOREGROUND = 0x0003 for both eventMin/eventMax - only that one event.
+$script:ForegroundChangeHook = [Win32]::SetWinEventHook(0x0003, 0x0003, [IntPtr]::Zero, $script:ForegroundChangeProc, 0, 0, 0)
+
 Update-WindowSets -Force
 Update-StatusBarContent
 $timer.Start()
@@ -1647,6 +1686,7 @@ try {
     $statusBarHoverTimer.Stop()
     $statusBarHoverTimer.Dispose()
     if ($script:MoveSizeEndHook -and $script:MoveSizeEndHook -ne [IntPtr]::Zero) { [Win32]::UnhookWinEvent($script:MoveSizeEndHook) | Out-Null }
+    if ($script:ForegroundChangeHook -and $script:ForegroundChangeHook -ne [IntPtr]::Zero) { [Win32]::UnhookWinEvent($script:ForegroundChangeHook) | Out-Null }
     # Un-hide anything parked on an inactive fake workspace so it can't be stranded when we quit.
     foreach ($hwnd in $script:WindowWorkspace.Keys) {
         [Win32]::ShowWindow($hwnd, 8) | Out-Null # SW_SHOWNA
