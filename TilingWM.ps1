@@ -1386,12 +1386,13 @@ function Update-StatusBarContent {
         $label = $script:StatusBarLabels[$i]
         if (-not $label) { continue }
         $apps = if ($byWorkspace.ContainsKey($i)) { $byWorkspace[$i] -join ', ' } else { $null }
-        $label.Visible = [bool]$apps
-        if (-not $apps) { continue }
+        $isActive = $i -eq $script:ActiveWorkspace
+        $label.Visible = [bool]($apps -or $isActive)
+        if (-not $label.Visible) { continue }
         $text = if ($apps) { "$i`: $apps" } else { "$i" }
         if ($label.Text -ne $text) { $label.Text = $text }
 
-        if ($i -eq $script:ActiveWorkspace) {
+        if ($isActive) {
             $label.BackColor = $activeColor
             $label.ForeColor = $textColor
         } elseif ($apps) {
