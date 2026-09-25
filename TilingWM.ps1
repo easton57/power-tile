@@ -413,6 +413,7 @@ $script:StatusBarBatteryLabel = $null # top-of-screen battery % label (only when
 $script:PowerMenuForm = $null   # separate interactive form for the top-left power button
 $script:PowerMenu = $null
 $script:PowerMenuButton = $null
+$script:PowerMenuDismissTimer = $null
 
 # ---------------------------------------------------------------------------
 # Window filtering
@@ -1142,6 +1143,7 @@ function Initialize-PowerMenu {
     $menu = New-Object System.Windows.Forms.ContextMenuStrip
     $menu.BackColor = $script:StatusBarColors.Busy
     $menu.ForeColor = $script:StatusBarColors.Text
+    $menu.AutoClose = $true
     $menu.ShowImageMargin = $false
     $menu.ShowCheckMargin = $false
     [void]$menu.Items.Add('Lock', $null, {
@@ -1167,6 +1169,29 @@ function Initialize-PowerMenu {
         } catch { Write-Log "Power menu failed: $_" }
     })
 
+    $dismissTimer = New-Object System.Windows.Forms.Timer
+    $dismissTimer.Interval = 50
+    $dismissTimer.add_Tick({
+        try {
+            if (-not $script:PowerMenu.Visible) { return }
+            $clicked = $false
+            foreach ($virtualKey in @(0x01, 0x02, 0x04)) {
+                $mouseState = [Win32]::GetAsyncKeyState($virtualKey)
+                if ($mouseState -lt 0 -or ($mouseState -band 1) -ne 0) { $clicked = $true; break }
+            }
+            if (-not $clicked) { return }
+
+            $cursor = [System.Windows.Forms.Cursor]::Position
+            $buttonOrigin = $script:PowerMenuButton.PointToScreen([System.Drawing.Point]::Empty)
+            $buttonBounds = [System.Drawing.Rectangle]::new($buttonOrigin.X, $buttonOrigin.Y, $script:PowerMenuButton.Width, $script:PowerMenuButton.Height)
+            if (-not $script:PowerMenu.Bounds.Contains($cursor) -and -not $buttonBounds.Contains($cursor)) {
+                $script:PowerMenu.Close()
+            }
+        } catch { Write-Log "Power menu dismissal failed: $_" }
+    })
+    $menu.add_Opened({ try { $script:PowerMenuDismissTimer.Start() } catch { Write-Log "Power menu dismissal timer failed: $_" } })
+    $menu.add_Closed({ try { $script:PowerMenuDismissTimer.Stop() } catch { Write-Log "Power menu dismissal timer failed: $_" } })
+
     [void]$form.Handle
     $exStyle = [Win32]::GetWindowLong($form.Handle, -20)
     $exStyle = $exStyle -bor 0x08000000 -bor 0x00000080 # WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
@@ -1175,6 +1200,7 @@ function Initialize-PowerMenu {
     $script:PowerMenuForm = $form
     $script:PowerMenu = $menu
     $script:PowerMenuButton = $button
+    $script:PowerMenuDismissTimer = $dismissTimer
     $form.Show()
 }
 
@@ -1422,6 +1448,7 @@ function Invoke-DelayedRelayout {
 function Switch-Workspace {
     # Fakes virtual desktops: hides windows on the outgoing workspace, shows the incoming one.
     param([int]$Workspace)
+    if ($script:PowerMenu -and $script:PowerMenu.Visible) { $script:PowerMenu.Close() }
     if ($Workspace -eq $script:ActiveWorkspace) { return }
 
     foreach ($hwnd in @($script:WindowWorkspace.Keys)) {
@@ -1754,6 +1781,7 @@ try {
     $trayIcon.Dispose()
     if ($script:TrayIconHandle -ne [IntPtr]::Zero) { [Win32]::DestroyIcon($script:TrayIconHandle) | Out-Null }
     if ($script:StatusBarForm -and -not $script:StatusBarForm.IsDisposed) { $script:StatusBarForm.Dispose() }
+    if ($script:PowerMenuDismissTimer) { $script:PowerMenuDismissTimer.Stop(); $script:PowerMenuDismissTimer.Dispose() }
     if ($script:PowerMenu -and -not $script:PowerMenu.IsDisposed) { $script:PowerMenu.Dispose() }
     if ($script:PowerMenuForm -and -not $script:PowerMenuForm.IsDisposed) { $script:PowerMenuForm.Dispose() }
     if ($script:AppLauncherForm -and -not $script:AppLauncherForm.IsDisposed) { $script:AppLauncherForm.Dispose() }
