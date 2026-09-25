@@ -18,7 +18,7 @@
     StatusBarShowBattery = $true # show battery % next to the clock - only if a battery is detected
 
     # colors accept '#RRGGBB' hex or named colors (e.g. 'DodgerBlue')
-    # Only the workspace slot labels are opaque - the rest of the bar is transparent.
+    # Occupied workspace slots and status widgets are opaque; the rest is transparent.
     StatusBarBackColor     = '#181818'  # empty (idle) workspace slots
     StatusBarActiveColor   = '#8800d7'  # active workspace slot background
     StatusBarBusyColor     = '#3C3C3C'  # non-active workspace slots that have apps open

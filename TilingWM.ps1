@@ -91,7 +91,7 @@ $script:DefaultConfig = @{
     # 'Left', 'Center', or 'Right' placement of the workspace slots within the bar
     StatusBarAlignment     = 'Left'
     # accepts '#RRGGBB' hex or named colors (e.g. 'DodgerBlue')
-    # Only the workspace slot labels are opaque - the rest of the bar is transparent.
+    # Occupied workspace slots and status widgets are opaque; the rest is transparent.
     StatusBarBackColor     = '#181818'
     StatusBarActiveColor   = '#0078D7'
     StatusBarBusyColor     = '#3C3C3C'
@@ -410,6 +410,9 @@ $script:StatusBarColors = @{}   # parsed Color objects, populated by Initialize-
 $script:StatusBarFlow = $null   # FlowLayoutPanel holding the workspace labels, repositioned for alignment
 $script:StatusBarClockLabel = $null   # top-of-screen clock label (only when HideTaskbar + StatusBarShowClock)
 $script:StatusBarBatteryLabel = $null # top-of-screen battery % label (only when a battery is present)
+$script:PowerMenuForm = $null   # separate interactive form for the top-left power button
+$script:PowerMenu = $null
+$script:PowerMenuButton = $null
 
 # ---------------------------------------------------------------------------
 # Window filtering
@@ -1107,6 +1110,74 @@ function ConvertTo-BarColor {
     }
 }
 
+function Initialize-PowerMenu {
+    param([System.Windows.Forms.Screen]$Screen, [int]$Height)
+
+    $buttonSize = $Height
+    $buttonX = $Screen.Bounds.X
+    $buttonY = $Screen.Bounds.Y
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.FormBorderStyle = 'None'
+    $form.StartPosition = 'Manual'
+    $form.ShowInTaskbar = $false
+    $form.TopMost = $true
+    $form.BackColor = $script:StatusBarColors.Busy
+    $form.MinimumSize = [System.Drawing.Size]::new($buttonSize, $buttonSize)
+    $form.MaximumSize = [System.Drawing.Size]::new($buttonSize, $buttonSize)
+    $form.Bounds = [System.Drawing.Rectangle]::new($buttonX, $buttonY, $buttonSize, $buttonSize)
+
+    $button = New-Object System.Windows.Forms.Button
+    $button.Dock = 'Fill'
+    $button.FlatStyle = 'Flat'
+    $button.FlatAppearance.BorderSize = 0
+    $button.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI Symbol', 11
+    $button.ForeColor = $script:StatusBarColors.Text
+    $button.BackColor = $script:StatusBarColors.Busy
+    $button.Text = [char]0x23FB
+    $button.Padding = [System.Windows.Forms.Padding]::Empty
+    $button.TabStop = $false
+    $form.Controls.Add($button)
+
+    $menu = New-Object System.Windows.Forms.ContextMenuStrip
+    $menu.BackColor = $script:StatusBarColors.Busy
+    $menu.ForeColor = $script:StatusBarColors.Text
+    $menu.ShowImageMargin = $false
+    $menu.ShowCheckMargin = $false
+    [void]$menu.Items.Add('Lock', $null, {
+        try { Start-Process -FilePath 'rundll32.exe' -ArgumentList 'user32.dll,LockWorkStation' } catch { Write-Log "Lock failed: $_" }
+    })
+    [void]$menu.Items.Add('Sleep', $null, {
+        try { [System.Windows.Forms.Application]::SetSuspendState('Suspend', $false, $false) | Out-Null } catch { Write-Log "Sleep failed: $_" }
+    })
+    [void]$menu.Items.Add('Restart computer', $null, {
+        try { Start-Process -FilePath 'shutdown.exe' -ArgumentList '/r /t 0' } catch { Write-Log "Computer restart failed: $_" }
+    })
+    [void]$menu.Items.Add('Shut down', $null, {
+        try { Start-Process -FilePath 'shutdown.exe' -ArgumentList '/s /t 0' } catch { Write-Log "Shut down failed: $_" }
+    })
+    [void]$menu.Items.Add('-')
+    [void]$menu.Items.Add('Exit power-tile', $null, {
+        try { Invoke-Quit } catch { Write-Log "Exit failed: $_" }
+    })
+
+    $button.add_Click({
+        try {
+            $script:PowerMenu.Show($script:PowerMenuButton, [System.Drawing.Point]::new(0, $script:PowerMenuButton.Height))
+        } catch { Write-Log "Power menu failed: $_" }
+    })
+
+    [void]$form.Handle
+    $exStyle = [Win32]::GetWindowLong($form.Handle, -20)
+    $exStyle = $exStyle -bor 0x08000000 -bor 0x00000080 # WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+    [Win32]::SetWindowLong($form.Handle, -20, $exStyle) | Out-Null
+
+    $script:PowerMenuForm = $form
+    $script:PowerMenu = $menu
+    $script:PowerMenuButton = $button
+    $form.Show()
+}
+
 function Initialize-StatusBar {
     $screen = [System.Windows.Forms.Screen]::PrimaryScreen
     $height = [int]$script:Config.StatusBarHeight
@@ -1120,7 +1191,7 @@ function Initialize-StatusBar {
     }
     $bg = $script:StatusBarColors.Background
     # Exact color that Form.TransparencyKey punches a see-through hole for - anything not
-    # painted with this color (i.e. only the workspace slot labels) stays opaque/visible.
+    # painted with this color stays opaque/visible.
     $keyColor = [System.Drawing.Color]::FromArgb(255, 1, 2, 3)
 
     $form = New-Object System.Windows.Forms.Form
@@ -1130,6 +1201,8 @@ function Initialize-StatusBar {
     $form.TopMost = $true
     $form.BackColor = $keyColor
     $form.TransparencyKey = $keyColor
+    $form.MinimumSize = [System.Drawing.Size]::new($screen.Bounds.Width, $height)
+    $form.MaximumSize = [System.Drawing.Size]::new($screen.Bounds.Width, $height)
     $form.Bounds = [System.Drawing.Rectangle]::new($screen.Bounds.X, $screen.Bounds.Y, $screen.Bounds.Width, $height)
 
     $flow = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -1164,6 +1237,8 @@ function Initialize-StatusBar {
     $exStyle = $exStyle -bor 0x08000000 -bor 0x00000080 -bor 0x00000020  # WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT
     [Win32]::SetWindowLong($form.Handle, -20, $exStyle) | Out-Null
 
+    $script:StatusBarForm = $form
+
     $script:StatusBarClockLabel = $null
     if ($script:Config.HideTaskbar -and $script:Config.StatusBarShowClock) {
         # Only shown when the taskbar is hidden, since that's what takes away the clock
@@ -1171,9 +1246,10 @@ function Initialize-StatusBar {
         # can sit flush against the right edge regardless of the workspace slots' alignment.
         $clock = New-Object System.Windows.Forms.Label
         $clock.AutoSize = $true
+        $clock.Padding = [System.Windows.Forms.Padding]::new(8, 4, 8, 4)
         $clock.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 9
         $clock.ForeColor = $script:StatusBarColors.Text
-        $clock.BackColor = $keyColor
+        $clock.BackColor = $script:StatusBarColors.Busy
         $form.Controls.Add($clock)
         $script:StatusBarClockLabel = $clock
     }
@@ -1184,9 +1260,10 @@ function Initialize-StatusBar {
         # taskbar doesn't surface either without a click, so show it whenever present.
         $battery = New-Object System.Windows.Forms.Label
         $battery.AutoSize = $true
+        $battery.Padding = [System.Windows.Forms.Padding]::new(8, 4, 8, 4)
         $battery.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 9
         $battery.ForeColor = $script:StatusBarColors.Text
-        $battery.BackColor = $keyColor
+        $battery.BackColor = $script:StatusBarColors.Busy
         $form.Controls.Add($battery)
         $script:StatusBarBatteryLabel = $battery
     }
@@ -1194,8 +1271,8 @@ function Initialize-StatusBar {
     Update-StatusBarClock
     Update-StatusBarBattery
     Update-StatusBarRightWidgets
+    Initialize-PowerMenu -Screen $screen -Height $height
 
-    $script:StatusBarForm = $form
     $form.Show()
 }
 
@@ -1252,7 +1329,7 @@ function Update-StatusBarAlignment {
     $x = switch ($script:Config.StatusBarAlignment) {
         'Center' { [int](($form.ClientSize.Width - $flow.Width) / 2) }
         'Right' { $form.ClientSize.Width - $flow.Width }
-        default { 0 }
+        default { if ($script:PowerMenuForm) { $script:PowerMenuForm.Width + 8 } else { 0 } }
     }
     $y = [int](($form.ClientSize.Height - $flow.Height) / 2)
     $flow.Location = [System.Drawing.Point]::new([Math]::Max(0, $x), [Math]::Max(0, $y))
@@ -1263,9 +1340,7 @@ function Update-StatusBarContent {
 
     $activeColor = $script:StatusBarColors.Active
     $busyColor = $script:StatusBarColors.Busy
-    $idleColor = $script:StatusBarColors.Background
     $textColor = $script:StatusBarColors.Text
-    $idleTextColor = $script:StatusBarColors.IdleText
 
     $byWorkspace = @{}
     foreach ($hwnd in @($script:WindowWorkspace.Keys)) {
@@ -1285,6 +1360,8 @@ function Update-StatusBarContent {
         $label = $script:StatusBarLabels[$i]
         if (-not $label) { continue }
         $apps = if ($byWorkspace.ContainsKey($i)) { $byWorkspace[$i] -join ', ' } else { $null }
+        $label.Visible = [bool]$apps
+        if (-not $apps) { continue }
         $text = if ($apps) { "$i`: $apps" } else { "$i" }
         if ($label.Text -ne $text) { $label.Text = $text }
 
@@ -1294,25 +1371,10 @@ function Update-StatusBarContent {
         } elseif ($apps) {
             $label.BackColor = $busyColor
             $label.ForeColor = $textColor
-        } else {
-            $label.BackColor = $idleColor
-            $label.ForeColor = $idleTextColor
         }
     }
 
     Update-StatusBarAlignment
-}
-
-function Invoke-StatusBarHoverTick {
-    # Hides the bar while the cursor is over it so it doesn't block clicks on window
-    # controls (snap layout button, title bar, etc.) that would otherwise sit under it.
-    if (-not $script:StatusBarForm -or $script:StatusBarForm.IsDisposed) { return }
-    $hovering = $script:StatusBarForm.Bounds.Contains([System.Windows.Forms.Cursor]::Position)
-    if ($hovering -and $script:StatusBarForm.Visible) {
-        $script:StatusBarForm.Hide()
-    } elseif (-not $hovering -and -not $script:StatusBarForm.Visible) {
-        $script:StatusBarForm.Show()
-    }
 }
 
 function Set-TrayWorkspaceIcon {
@@ -1624,12 +1686,6 @@ $mouseTimer.add_Tick({
     try { Invoke-FocusFollowsMouseTick } catch { Write-Log "Invoke-FocusFollowsMouseTick failed: $_" }
 })
 
-$statusBarHoverTimer = New-Object System.Windows.Forms.Timer
-$statusBarHoverTimer.Interval = 100
-$statusBarHoverTimer.add_Tick({
-    try { Invoke-StatusBarHoverTick } catch { Write-Log "Invoke-StatusBarHoverTick failed: $_" }
-})
-
 # Fires the instant the user finishes dragging/resizing ANY top-level window (mouse-up after
 # a title-bar drag or border resize) - snaps a tiled window straight back into its grid slot
 # instead of leaving it wherever it was dropped until the next poll or a manual Alt+Shift+R.
@@ -1671,7 +1727,6 @@ Update-WindowSets -Force
 Update-StatusBarContent
 $timer.Start()
 if ($script:Config.FocusFollowsMouse) { $mouseTimer.Start() }
-if ($script:Config.ShowStatusBar) { $statusBarHoverTimer.Start() }
 
 Write-Log "PS Tiling Manager running. Press Alt+Shift+E (or use the tray icon) to quit." -Level Info
 
@@ -1683,8 +1738,6 @@ try {
     $timer.Dispose()
     $mouseTimer.Stop()
     $mouseTimer.Dispose()
-    $statusBarHoverTimer.Stop()
-    $statusBarHoverTimer.Dispose()
     if ($script:MoveSizeEndHook -and $script:MoveSizeEndHook -ne [IntPtr]::Zero) { [Win32]::UnhookWinEvent($script:MoveSizeEndHook) | Out-Null }
     if ($script:ForegroundChangeHook -and $script:ForegroundChangeHook -ne [IntPtr]::Zero) { [Win32]::UnhookWinEvent($script:ForegroundChangeHook) | Out-Null }
     # Un-hide anything parked on an inactive fake workspace so it can't be stranded when we quit.
@@ -1701,6 +1754,8 @@ try {
     $trayIcon.Dispose()
     if ($script:TrayIconHandle -ne [IntPtr]::Zero) { [Win32]::DestroyIcon($script:TrayIconHandle) | Out-Null }
     if ($script:StatusBarForm -and -not $script:StatusBarForm.IsDisposed) { $script:StatusBarForm.Dispose() }
+    if ($script:PowerMenu -and -not $script:PowerMenu.IsDisposed) { $script:PowerMenu.Dispose() }
+    if ($script:PowerMenuForm -and -not $script:PowerMenuForm.IsDisposed) { $script:PowerMenuForm.Dispose() }
     if ($script:AppLauncherForm -and -not $script:AppLauncherForm.IsDisposed) { $script:AppLauncherForm.Dispose() }
     if (-not $hotkeyWindow.IsDisposed) { $hotkeyWindow.Dispose() }
     # Marker for Watch-TilingWM.ps1: its presence (with a fresh timestamp) means this was a
