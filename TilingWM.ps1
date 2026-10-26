@@ -25,7 +25,7 @@
         Alt+Shift+1..9  Move focused window to workspace 1-9
         Ctrl+Shift+Space  Open the app launcher (fuzzy-search installed apps, Enter to run)
         Ctrl+Shift+R      Restart (relaunch fresh - picks up script/config edits without
-                          logging out; workspace assignments/ratios are preserved)
+                          logging out)
 
     Focus follows mouse is on by default (hover a tiled window to focus it, no
     click needed) - set FocusFollowsMouse = $false in the config to disable it.
@@ -34,6 +34,9 @@
     (name -> @{ Key = 'Alt+Shift+Enter'; Path = 'wt.exe' }) to bind hotkeys that
     launch programs. None are bound by default; see the sample config for examples.
 
+    The Ctrl+Shift+Space fuzzy launcher lives in AppLauncher.ps1, which this script starts
+    as a separate process (and stops on exit) whenever HotKeys.AppLauncher is set.
+
     A tray icon is shown while running; right-click it for "Retile now" / "Restart" / "Exit".
     A status bar across the top of the primary monitor lists which apps are open
     on each workspace (1-9), highlighting the active one - set ShowStatusBar =
@@ -41,31 +44,61 @@
     real Windows taskbar (restored automatically on exit) and reclaim its space
     for tiling; StatusBarShowClock then adds a clock/date to the status bar so
     you don't lose the taskbar's clock in the process.
-    Only auto-tiling + hotkeys are implemented (see hyprland-style-tiling-wm-notes.md);
-    compositor-level effects (blur/animations/gaps rendering) are not possible on Windows.
-    Workspaces are simulated (per the notes) by hiding/showing windows, not real virtual
-    desktops - a window's taskbar entry disappears while it's on an inactive workspace.
+    Only auto-tiling + hotkeys are implemented; compositor-level effects (blur/animations/
+    gaps rendering) are not possible on Windows. Workspaces are simulated by hiding/showing
+    windows, not real virtual desktops - a window's taskbar entry disappears while it's on
+    an inactive workspace.
 
-    Run Watch-TilingWM.ps1 alongside this script (also wired into
-    Install-TilingWMStartup.ps1) to get a tray notification if this process crashes or
-    is force-killed - it only notifies, it does not relaunch anything.
+    Only one instance runs at a time; logs are written to %LOCALAPPDATA%\power-tile.
 #>
 
+Import-Module (Join-Path $PSScriptRoot 'PowerTile.Common.psm1') -Force -DisableNameChecking
+
 # ---------------------------------------------------------------------------
-# Logging - written to a file next to the script even when running hidden
-# (autostart uses -WindowStyle Hidden, so console output would otherwise be lost)
+# Logging - written to a file even when running hidden (autostart uses
+# -WindowStyle Hidden, so console output would otherwise be lost)
 # ---------------------------------------------------------------------------
 
-$script:LogPath = Join-Path $PSScriptRoot 'TilingWM.log'
-$script:StatePath = Join-Path $PSScriptRoot 'TilingWM.state.json'
+$script:DataDir = Get-PowerTileDataDirectory
+$script:LogPath = Join-Path $script:DataDir 'TilingWM.log'
+$script:LogLevelRank = @{ Debug = 0; Info = 1; Warning = 2 }
 function Write-Log {
-    param([string]$Message, [ValidateSet('Info', 'Warning')][string]$Level = 'Warning')
-    if ($Level -eq 'Warning') { Write-Warning $Message } else { Write-Host $Message -ForegroundColor Cyan }
-    try { Add-Content -LiteralPath $script:LogPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] $Message" -ErrorAction Stop } catch { }
+    param([string]$Message, [ValidateSet('Debug', 'Info', 'Warning')][string]$Level = 'Warning')
+    # Config isn't loaded yet for the earliest calls, so default to Info-and-above.
+    $minLevel = if ($script:Config -and $script:Config.LogLevel) { [string]$script:Config.LogLevel } else { 'Info' }
+    if (-not $script:LogLevelRank.ContainsKey($minLevel)) { $minLevel = 'Info' }
+    if ($script:LogLevelRank[$Level] -lt $script:LogLevelRank[$minLevel]) { return }
+
+    switch ($Level) {
+        'Warning' { Write-Warning $Message }
+        'Info' { Write-Host $Message -ForegroundColor Cyan }
+        default { Write-Host $Message -ForegroundColor DarkGray }
+    }
+    try {
+        # Debug logging is chatty enough to fill a disk over weeks of uptime - roll the file
+        # over once instead of truncating, so the run leading up to a crash is still readable.
+        $maxBytes = 1024 * [int]$(if ($script:Config -and $script:Config.LogMaxSizeKB) { $script:Config.LogMaxSizeKB } else { 2048 })
+        $existing = Get-Item -LiteralPath $script:LogPath -ErrorAction SilentlyContinue
+        if ($existing -and $existing.Length -gt $maxBytes) {
+            Move-Item -LiteralPath $script:LogPath -Destination "$($script:LogPath).1" -Force -ErrorAction Stop
+        }
+    } catch { }
+    try { Add-Content -LiteralPath $script:LogPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [$($Level.Substring(0,1))] $Message" -ErrorAction Stop } catch { }
 }
-# Clear any leftover clean-shutdown marker from a previous run - see the sentinel write
-# at the bottom of this script and Watch-TilingWM.ps1 for why this file exists.
-Remove-Item -LiteralPath (Join-Path $PSScriptRoot 'TilingWM.stopped') -ErrorAction SilentlyContinue
+
+# ---------------------------------------------------------------------------
+# Single instance - two managers tiling the same windows fight each other endlessly.
+# A restart (Ctrl+Shift+R) launches the new instance before the old one has finished
+# shutting down, so wait for the lock briefly rather than giving up immediately.
+# ---------------------------------------------------------------------------
+
+$script:InstanceMutex = New-Object System.Threading.Mutex($false, 'Local\PowerTile.TilingWM')
+$instanceAcquired = $false
+try { $instanceAcquired = $script:InstanceMutex.WaitOne(15000) } catch [System.Threading.AbandonedMutexException] { $instanceAcquired = $true }
+if (-not $instanceAcquired) {
+    Write-Log "Another PS Tiling Manager instance is already running - exiting (pid $PID)."
+    exit 1
+}
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -74,7 +107,12 @@ Remove-Item -LiteralPath (Join-Path $PSScriptRoot 'TilingWM.stopped') -ErrorActi
 $script:DefaultConfig = @{
     Gap                = 8
     MasterRatio        = 0.55
-    PollIntervalMs      = 400
+    # Safety-net rescan interval; window show/hide events already trigger an immediate one.
+    PollIntervalMs      = 1000
+    # 'Warning' (problems only), 'Info' (+ lifecycle events), or 'Debug' (+ per-layout
+    # geometry, display changes, windows that refuse the size we gave them).
+    LogLevel            = 'Info'
+    LogMaxSizeKB        = 2048  # TilingWM.log rolls over to TilingWM.log.1 past this size
     FocusFollowsMouse       = $true
     FocusFollowsMousePollMs = 100
     ShowStatusBar       = $true
@@ -196,8 +234,36 @@ public class Win32
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
-    [DllImport("user32.dll")]
+    [DllImport("user32.dll", SetLastError = true)]
     public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsZoomed(IntPtr hWnd);
+
+    // "x,y WxH" for logging, or "?" if the window is gone/inaccessible.
+    public static string GetRectString(IntPtr hWnd)
+    {
+        RECT r;
+        if (!GetWindowRect(hWnd, out r)) return "?";
+        return string.Format("{0},{1} {2}x{3}", r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top);
+    }
+
+    // Wraps SetWindowPos so the caller can log why it failed instead of just seeing "false".
+    public static int SetWindowPosEx(IntPtr hWnd, int X, int Y, int cx, int cy, uint uFlags)
+    {
+        if (SetWindowPos(hWnd, IntPtr.Zero, X, Y, cx, cy, uFlags)) return 0;
+        int err = Marshal.GetLastWin32Error();
+        return err == 0 ? -1 : err;
+    }
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
@@ -221,9 +287,6 @@ public class Win32
     public static extern bool DestroyIcon(IntPtr hIcon);
 
     [DllImport("user32.dll")]
-    public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
-
-    [DllImport("user32.dll")]
     public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
 
     [DllImport("user32.dll")]
@@ -232,39 +295,44 @@ public class Win32
     [DllImport("kernel32.dll")]
     public static extern uint GetCurrentThreadId();
 
-    // Windows normally refuses SetForegroundWindow for a window that isn't owned by
-    // whatever the user was just interacting with (e.g. a popup opened via a global
-    // hotkey) - attaching input queues plus faking a key press satisfies the checks
-    // that would otherwise just flash the taskbar entry instead of focusing the window.
+    [DllImport("user32.dll")]
+    public static extern bool BringWindowToTop(IntPtr hWnd);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+
+    // MOUSEINPUT is the largest member of the native INPUT union, so this layout has the right size.
+    [StructLayout(LayoutKind.Sequential)]
+    struct INPUT { public uint type; public MOUSEINPUT mi; }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    // Windows only lets the process that generated the last input event take the foreground,
+    // and polling the cursor position (focus-follows-mouse) doesn't count. Injecting a zero-
+    // distance mouse move earns that permission with no side effects - unlike a synthetic Alt
+    // tap, which pops Office's KeyTips/menu bars and can confuse held-modifier state.
     public static void ForceForegroundWindow(IntPtr hWnd)
     {
         if (hWnd == IntPtr.Zero) return;
-        IntPtr fg = GetForegroundWindow();
-        if (fg == hWnd) return;
+        if (GetForegroundWindow() == hWnd) return;
 
+        var input = new INPUT[1];
+        input[0].type = 0; // INPUT_MOUSE
+        input[0].mi.dwFlags = 0x0001; // MOUSEEVENTF_MOVE, dx = dy = 0
+        SendInput(1, input, Marshal.SizeOf(typeof(INPUT)));
+        if (SetForegroundWindow(hWnd) && GetForegroundWindow() == hWnd) return;
+
+        // Fallback for when another process holds the foreground lock.
+        IntPtr fg = GetForegroundWindow();
         uint dummy;
         uint fgThread = fg == IntPtr.Zero ? 0 : GetWindowThreadProcessId(fg, out dummy);
         uint curThread = GetCurrentThreadId();
-
         bool attached = fgThread != 0 && fgThread != curThread && AttachThreadInput(curThread, fgThread, true);
         try
         {
-            const byte VK_MENU = 0x12;
-            const uint KEYEVENTF_KEYUP = 0x2;
-            // The fake down+up below is what actually earns permission to steal focus (Windows
-            // grants SetForegroundWindow to whichever process last "generated" an input event) -
-            // it must always be sent, even if Alt happens to already be down for real, or the
-            // popup just flashes in and gets deactivated/closed immediately (no focus granted).
-            keybd_event(VK_MENU, 0, 0, UIntPtr.Zero);
+            BringWindowToTop(hWnd);
             SetForegroundWindow(hWnd);
-            keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, UIntPtr.Zero);
-            // This normally runs from an Alt+<key> global hotkey (e.g. the app launcher's
-            // Alt+Space), where the real Alt key is very likely still physically held down at
-            // this exact moment - the fake "up" just told Windows Alt was released while the
-            // physical key remains down, which can make the *next* Alt-chord hotkey misfire.
-            // Re-assert a synthetic Alt-down to correct that; its matching "up" comes for free
-            // once the user actually releases the real key.
-            if ((GetAsyncKeyState(VK_MENU) & 0x8000) != 0) { keybd_event(VK_MENU, 0, 0, UIntPtr.Zero); }
         }
         finally
         {
@@ -384,6 +452,72 @@ public class ClickThroughOverlayForm : Form
         if (m.Msg == 0x0084) m.Result = (IntPtr)(-1); // WM_NCHITTEST / HTTRANSPARENT
     }
 }
+
+// Raises Changed shortly after a top-level window anywhere is shown, hidden, minimized,
+// restored, cloaked or uncloaked, so tiling reacts immediately instead of on the next poll.
+// Filtering and debouncing happen here in C# because these events arrive by the hundred
+// (every control in every app), and running a PowerShell scriptblock for each would be costly.
+public class WindowChangeWatcher : IDisposable
+{
+    public event EventHandler Changed;
+
+    readonly Win32.WinEventDelegate proc;
+    readonly List<IntPtr> hooks = new List<IntPtr>();
+    readonly Timer debounce = new Timer();
+    readonly int debounceMs;
+    readonly int minIntervalMs;
+    DateTime lastFired = DateTime.MinValue;
+
+    public WindowChangeWatcher(int debounceMs, int minIntervalMs)
+    {
+        this.debounceMs = Math.Max(1, debounceMs);
+        this.minIntervalMs = Math.Max(0, minIntervalMs);
+        proc = OnEvent; // must stay referenced for as long as the hooks exist
+        debounce.Tick += (s, e) =>
+        {
+            debounce.Stop();
+            lastFired = DateTime.UtcNow;
+            var handler = Changed;
+            if (handler != null) handler(this, EventArgs.Empty);
+        };
+    }
+
+    public void Start()
+    {
+        Hook(0x8002, 0x8003); // EVENT_OBJECT_SHOW .. EVENT_OBJECT_HIDE
+        Hook(0x0016, 0x0017); // EVENT_SYSTEM_MINIMIZESTART .. MINIMIZEEND
+        Hook(0x8017, 0x8018); // EVENT_OBJECT_CLOAKED .. UNCLOAKED (UWP windows appear this way)
+    }
+
+    void Hook(uint eventMin, uint eventMax)
+    {
+        // WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS - our own bar/menus/tray are ignored.
+        IntPtr h = Win32.SetWinEventHook(eventMin, eventMax, IntPtr.Zero, proc, 0, 0, 0x0002);
+        if (h != IntPtr.Zero) hooks.Add(h);
+    }
+
+    void OnEvent(IntPtr hook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
+    {
+        if (hwnd == IntPtr.Zero || idObject != 0 || idChild != 0) return; // OBJID_WINDOW, CHILDID_SELF
+        if (Win32.GetAncestor(hwnd, 2) != hwnd) return; // GA_ROOT - top-level windows only
+        int exStyle = Win32.GetWindowLong(hwnd, -20);
+        if ((exStyle & 0x80) != 0 && (exStyle & 0x40000) == 0) return; // tooltips, menus, etc.
+        if (debounce.Enabled) return;
+        // Wait out the rest of a burst, and never fire more often than minIntervalMs even
+        // if some app churns windows constantly.
+        double sinceLast = (DateTime.UtcNow - lastFired).TotalMilliseconds;
+        debounce.Interval = (int)Math.Max(debounceMs, minIntervalMs - sinceLast);
+        debounce.Start();
+    }
+
+    public void Dispose()
+    {
+        foreach (var h in hooks) Win32.UnhookWinEvent(h);
+        hooks.Clear();
+        debounce.Stop();
+        debounce.Dispose();
+    }
+}
 '@
 }
 
@@ -403,6 +537,7 @@ $script:DismissedWindows = New-Object 'System.Collections.Generic.HashSet[IntPtr
 $script:ActiveWorkspace = 1
 $script:WorkspaceMasterRatio = @{} # "workspace|MonitorKey" -> master ratio override, falls back to Config.MasterRatio
 $script:LastMousePos = $null # last-seen cursor position, so focus-follows-mouse only reacts to actual movement
+$script:LastScreenSignature = $null # last-seen display topology, for change detection in Test-DisplayTopologyChanged
 $script:TrayIconHandle = [IntPtr]::Zero # native HICON backing the tray workspace badge
 $script:StatusBarForm = $null   # top-of-screen form listing apps per workspace
 $script:StatusBarLabels = @{}   # workspace number -> Label control inside the status bar
@@ -494,8 +629,114 @@ function Test-AlwaysVisibleWindow {
 }
 
 # ---------------------------------------------------------------------------
+# Diagnostics - geometry/state dumps for after-the-fact debugging of layout bugs
+# ("only half my screen is usable", windows tiled off-screen, a monitor vanishing)
+# ---------------------------------------------------------------------------
+
+function Get-ScreenSignature {
+    # Compact, comparable description of the current display topology.
+    $parts = foreach ($s in [System.Windows.Forms.Screen]::AllScreens) {
+        $b = $s.Bounds; $w = $s.WorkingArea
+        "$($s.DeviceName)$(if ($s.Primary) { '*' })|B:$($b.X),$($b.Y),$($b.Width)x$($b.Height)|W:$($w.X),$($w.Y),$($w.Width)x$($w.Height)"
+    }
+    ($parts -join ' ; ')
+}
+
+function Get-WindowDescription {
+    param([IntPtr]$Hwnd)
+    $procId = 0
+    [Win32]::GetWindowThreadProcessId($Hwnd, [ref]$procId) | Out-Null
+    try { $procName = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch { $procName = '?' }
+    "hwnd=$Hwnd proc=$procName class=$([Win32]::GetClass($Hwnd)) title='$([Win32]::GetTitle($Hwnd))' rect=$([Win32]::GetRectString($Hwnd))"
+}
+
+function Write-DiagnosticSnapshot {
+    param([string]$Reason = 'manual')
+    try {
+        Write-Log "--- DIAGNOSTIC SNAPSHOT ($Reason) ---" -Level Info
+        Write-Log "screens: $(Get-ScreenSignature)" -Level Info
+        $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+        Write-Log "virtualScreen=$($vs.X),$($vs.Y) $($vs.Width)x$($vs.Height)" -Level Info
+        Write-Log "activeWorkspace=$($script:ActiveWorkspace) gap=$($script:Config.Gap) masterRatio=$($script:Config.MasterRatio) hideTaskbar=$($script:Config.HideTaskbar) statusBar=$($script:Config.ShowStatusBar)/$($script:Config.StatusBarHeight)" -Level Info
+        $ratios = ($script:WorkspaceMasterRatio.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', '
+        Write-Log "workspaceMasterRatio: $ratios" -Level Info
+        # A taskbar/AppBar that's grown to an unexpected size is itself a way to lose usable screen.
+        foreach ($hwnd in [Win32]::GetTopLevelWindows()) {
+            $class = [Win32]::GetClass($hwnd)
+            if ($class -eq 'Shell_TrayWnd' -or $class -eq 'Shell_SecondaryTrayWnd') {
+                Write-Log "taskbar $class visible=$([Win32]::IsWindowVisible($hwnd)) rect=$([Win32]::GetRectString($hwnd))" -Level Info
+            }
+        }
+        Write-Log "foreground: $(Get-WindowDescription -Hwnd ([Win32]::GetForegroundWindow()))" -Level Info
+        foreach ($key in $script:ManagedWindows.Keys) {
+            $list = $script:ManagedWindows[$key]
+            Write-Log "monitor '$key': $($list.Count) tiled window(s)" -Level Info
+            for ($i = 0; $i -lt $list.Count; $i++) {
+                Write-Log "  [$i]$(if ($i -eq 0) { ' master' } else { ' stack ' }) $(Get-WindowDescription -Hwnd $list[$i])" -Level Info
+            }
+        }
+        if ($script:FloatingWindows.Count -gt 0) {
+            Write-Log "floating: $($script:FloatingWindows.Count) window(s)" -Level Info
+            foreach ($hwnd in $script:FloatingWindows) { Write-Log "  $(Get-WindowDescription -Hwnd $hwnd)" -Level Info }
+        }
+        Write-Log "--- END SNAPSHOT ---" -Level Info
+    } catch { Write-Log "Write-DiagnosticSnapshot failed: $_" }
+}
+
+function Test-DisplayTopologyChanged {
+    # Cheap per-poll guard: catches monitor add/remove/resolution/DPI/taskbar-size changes
+    # even when the WM_DISPLAYCHANGE-driven event below doesn't fire (RDP, dock/undock).
+    $sig = Get-ScreenSignature
+    if ($script:LastScreenSignature -and $script:LastScreenSignature -ne $sig) {
+        Write-Log "Display topology changed:" -Level Info
+        Write-Log "  was: $($script:LastScreenSignature)" -Level Info
+        Write-Log "  now: $sig" -Level Info
+        $script:LastScreenSignature = $sig
+        return $true
+    }
+    $script:LastScreenSignature = $sig
+    return $false
+}
+
+# ---------------------------------------------------------------------------
 # Layout engine (master-stack, per monitor)
 # ---------------------------------------------------------------------------
+
+function Set-TiledWindowPos {
+    # Single choke point for every tile placement so each one is logged, Win32 failures
+    # surface with a real error code, and windows that silently refuse the requested size
+    # (the usual cause of "half my screen is unusable") get called out by name.
+    param([IntPtr]$Hwnd, [string]$Role, [int]$X, [int]$Y, [int]$Width, [int]$Height, [uint32]$Flags)
+
+    if ($Width -le 0 -or $Height -le 0) {
+        Write-Log "Refusing degenerate tile for $Role - computed ${Width}x${Height} at $X,$Y. $(Get-WindowDescription -Hwnd $Hwnd)"
+        return
+    }
+    $before = [Win32]::GetRectString($Hwnd)
+    # A maximized window ignores SetWindowPos sizing and stays full-screen (Edge reopens
+    # maximized, for example), so restore it first - without activating it.
+    if ([Win32]::IsZoomed($Hwnd)) {
+        Write-Log "Restoring maximized window before tiling ($Role). $(Get-WindowDescription -Hwnd $Hwnd)" -Level Debug
+        [Win32]::ShowWindow($Hwnd, 4) | Out-Null # SW_SHOWNOACTIVATE
+    }
+    $err = [Win32]::SetWindowPosEx($Hwnd, $X, $Y, $Width, $Height, $Flags)
+    if ($err -ne 0) {
+        Write-Log "SetWindowPos failed (win32 error $err) for $Role -> $X,$Y ${Width}x${Height}. $(Get-WindowDescription -Hwnd $Hwnd)"
+        return
+    }
+    $r = New-Object 'Win32+RECT'
+    if (-not [Win32]::GetWindowRect($Hwnd, [ref]$r)) { return }
+    $actualW = $r.Right - $r.Left
+    $actualH = $r.Bottom - $r.Top
+    # Tolerance covers invisible DWM shadow borders and apps with a minimum size / step sizing.
+    $tolerance = 24
+    if ([Math]::Abs($actualW - $Width) -gt $tolerance -or [Math]::Abs($actualH - $Height) -gt $tolerance -or
+        [Math]::Abs($r.Left - $X) -gt $tolerance -or [Math]::Abs($r.Top - $Y) -gt $tolerance) {
+        Write-Log "Window did not accept its tile ($Role): asked $X,$Y ${Width}x${Height}, got $($r.Left),$($r.Top) ${actualW}x${actualH} (was $before, maximized=$([Win32]::IsZoomed($Hwnd)), minimized=$([Win32]::IsIconic($Hwnd))). $(Get-WindowDescription -Hwnd $Hwnd)"
+    } else {
+        Write-Log "tile $Role -> $X,$Y ${Width}x${Height} $(Get-WindowDescription -Hwnd $Hwnd)" -Level Debug
+    }
+}
 
 function Set-MonitorLayout {
     param([string]$MonitorKey)
@@ -504,7 +745,12 @@ function Set-MonitorLayout {
     if (-not $list -or $list.Count -eq 0) { return }
 
     $screen = [System.Windows.Forms.Screen]::AllScreens | Where-Object { $_.DeviceName -eq $MonitorKey } | Select-Object -First 1
-    if (-not $screen) { return }
+    if (-not $screen) {
+        # Windows enumerated this monitor when the windows were assigned to it, and doesn't now -
+        # every window tracked here is about to be left un-tiled wherever it happens to sit.
+        Write-Log "Cannot lay out monitor '$MonitorKey' - no matching screen. $($list.Count) window(s) left untiled. Screens now: $(Get-ScreenSignature)"
+        return
+    }
 
     # With the taskbar hidden, Windows never updates the reported working area (we hide it
     # ourselves rather than toggling the OS auto-hide setting), so use the full monitor
@@ -516,13 +762,22 @@ function Set-MonitorLayout {
         $barHeight = [int]$script:Config.StatusBarHeight
         $wa = [System.Drawing.Rectangle]::new($wa.X, $wa.Y + $barHeight, $wa.Width, $wa.Height - $barHeight)
     }
+    # A working area much smaller than the monitor it belongs to means something external
+    # reserved that space (a rogue AppBar, a stuck full-screen-sized taskbar, a stale
+    # pre-resolution-change working area) - that shows up as "I can only use part of my
+    # screen" with no error anywhere, so make it loud and record both rectangles.
+    if ($wa.Width -lt ($screen.Bounds.Width * 0.9) -or $wa.Height -lt ($screen.Bounds.Height * 0.75)) {
+        Write-Log "Usable area on '$MonitorKey' is much smaller than the monitor: tiling into $($wa.X),$($wa.Y) $($wa.Width)x$($wa.Height) of bounds $($screen.Bounds.X),$($screen.Bounds.Y) $($screen.Bounds.Width)x$($screen.Bounds.Height) (workingArea=$($screen.WorkingArea.X),$($screen.WorkingArea.Y) $($screen.WorkingArea.Width)x$($screen.WorkingArea.Height), hideTaskbar=$($script:Config.HideTaskbar), statusBarHeight=$($script:Config.StatusBarHeight))"
+    }
+
     $g = [int]$script:Config.Gap
     $ratioKey = "$($script:ActiveWorkspace)|$MonitorKey"
     $ratio = if ($script:WorkspaceMasterRatio.ContainsKey($ratioKey)) { [double]$script:WorkspaceMasterRatio[$ratioKey] } else { [double]$script:Config.MasterRatio }
     $flags = 0x0004 -bor 0x0010 # SWP_NOZORDER | SWP_NOACTIVATE
+    Write-Log "layout '$MonitorKey': $($list.Count) window(s), area $($wa.X),$($wa.Y) $($wa.Width)x$($wa.Height), gap=$g, ratio=$ratio (key '$ratioKey'), workspace=$($script:ActiveWorkspace)" -Level Debug
 
     if ($list.Count -eq 1) {
-        [Win32]::SetWindowPos($list[0], [IntPtr]::Zero, $wa.X + $g, $wa.Y + $g, $wa.Width - (2 * $g), $wa.Height - (2 * $g), $flags) | Out-Null
+        Set-TiledWindowPos -Hwnd $list[0] -Role 'only' -X ($wa.X + $g) -Y ($wa.Y + $g) -Width ($wa.Width - (2 * $g)) -Height ($wa.Height - (2 * $g)) -Flags $flags
         return
     }
 
@@ -532,7 +787,7 @@ function Set-MonitorLayout {
     $masterX = $wa.X + $g
     $masterY = $wa.Y + $g
     $masterHeight = $wa.Height - (2 * $g)
-    [Win32]::SetWindowPos($list[0], [IntPtr]::Zero, $masterX, $masterY, $masterWidth, $masterHeight, $flags) | Out-Null
+    Set-TiledWindowPos -Hwnd $list[0] -Role 'master' -X $masterX -Y $masterY -Width $masterWidth -Height $masterHeight -Flags $flags
 
     $stackX = $masterX + $masterWidth + $g
     $stackCount = $list.Count - 1
@@ -541,13 +796,20 @@ function Set-MonitorLayout {
     $y = $wa.Y + $g
 
     for ($i = 1; $i -lt $list.Count; $i++) {
-        [Win32]::SetWindowPos($list[$i], [IntPtr]::Zero, $stackX, $y, $stackWidth, $eachHeight, $flags) | Out-Null
+        Set-TiledWindowPos -Hwnd $list[$i] -Role "stack$i" -X $stackX -Y $y -Width $stackWidth -Height $eachHeight -Flags $flags
         $y += $eachHeight + $g
     }
 }
 
 function Update-WindowSets {
     param([switch]$Force)
+
+    # A resolution/monitor/DPI change silently invalidates every cached tile - log it (so a
+    # later "half my screen" report can be lined up against it) and force a full relayout.
+    if (Test-DisplayTopologyChanged) {
+        Write-DiagnosticSnapshot -Reason 'display topology changed'
+        $Force = [switch]$true
+    }
 
     $allHwnds = [Win32]::GetTopLevelWindows()
     $byMonitor = @{}
@@ -679,10 +941,9 @@ function Get-FocusedManagedWindow {
 }
 
 function Invoke-FocusFollowsMouseTick {
-    # Skip while the app launcher is open - otherwise this fires within 100ms of it being
-    # shown/activated and steals focus back to whatever tiled window is under the cursor,
-    # which triggers the launcher's Deactivate handler and closes it immediately.
-    if ($script:AppLauncherForm -and -not $script:AppLauncherForm.IsDisposed) { return }
+    # Skip while the app launcher is focused - otherwise nudging the mouse over a tiled window
+    # steals focus back to it, which makes the launcher hide itself (it closes on deactivate).
+    if (Test-AppLauncherForeground) { return }
     $pos = [System.Windows.Forms.Cursor]::Position
     # Without this, a stationary cursor resting over some other tiled window (top-right
     # corner, wherever) would still re-force focus to it every single tick, fighting any
@@ -702,9 +963,7 @@ function Invoke-FocusFollowsMouseTick {
             # Plain SetForegroundWindow from this background timer almost always just flashes
             # the taskbar entry instead of actually focusing anything - Windows only grants
             # foreground to a process that itself "generated" the last input event, and polling
-            # GetCursorPos doesn't count (this is the same restriction ForceForegroundWindow
-            # already works around for the app launcher; it wasn't applied here before, which is
-            # why focus-follows-mouse only worked by chance).
+            # GetCursorPos doesn't count. ForceForegroundWindow works around that.
             [Win32]::ForceForegroundWindow($hwnd)
             return
         }
@@ -798,6 +1057,7 @@ function Invoke-ResizeMaster {
         $ratioKey = "$($script:ActiveWorkspace)|$key"
         $current = if ($script:WorkspaceMasterRatio.ContainsKey($ratioKey)) { [double]$script:WorkspaceMasterRatio[$ratioKey] } else { [double]$script:Config.MasterRatio }
         $script:WorkspaceMasterRatio[$ratioKey] = [Math]::Min(0.9, [Math]::Max(0.1, $current + $Delta))
+        Write-Log "Master ratio for '$ratioKey': $current -> $($script:WorkspaceMasterRatio[$ratioKey])" -Level Info
         Set-MonitorLayout -MonitorKey $key
     }
 }
@@ -845,8 +1105,7 @@ function Invoke-Quit {
 
 function Invoke-Restart {
     # Relaunches a fresh instance of this same script (picking up any edits to it or to
-    # TilingWM.config.psd1) and exits this one - workspace assignments/ratios survive the
-    # handoff via Save-TilingWMState/Restore-TilingWMState, same as a normal clean exit.
+    # TilingWM.config.psd1) and exits this one.
     Write-Log "Restarting..." -Level Info
     try {
         $exePath = (Get-Process -Id $PID).Path
@@ -888,214 +1147,39 @@ function Invoke-LaunchApp {
 }
 
 # ---------------------------------------------------------------------------
-# App launcher (Ctrl+Shift+Space fuzzy finder over installed apps - Get-StartApps
-# covers both classic Win32 shortcuts and Store/UWP apps in one call).
+# App launcher - runs as its own process (AppLauncher.ps1) that owns its hotkey and
+# window, so it can take focus reliably and never blocks (or is blocked by) tiling.
 # ---------------------------------------------------------------------------
 
-function Get-FuzzyScore {
-    # Higher is better; $null means no match at all. Prefix match beats substring
-    # match beats an in-order (possibly non-contiguous) subsequence match.
-    param([string]$Text, [string]$Query)
-    $t = $Text.ToLowerInvariant()
-    $q = $Query.ToLowerInvariant()
-    if ($t.StartsWith($q)) { return 1000 - $t.Length }
-    $idx = $t.IndexOf($q)
-    if ($idx -ge 0) { return 500 - $idx }
-    $searchFrom = 0
-    $score = 0
-    foreach ($c in $q.ToCharArray()) {
-        $found = $t.IndexOf($c, $searchFrom)
-        if ($found -lt 0) { return $null }
-        $score += (100 - $found)
-        $searchFrom = $found + 1
-    }
-    return $score
-}
+$script:AppLauncherWindowTitle = 'power-tile launcher' # must match AppLauncher.ps1
+$script:AppLauncherProcess = $null
 
-function Update-AppLauncherResults {
-    $query = $script:AppLauncherTextBox.Text
-    # The outer @() must wrap the whole if/else, not just the branch bodies - otherwise a
-    # single-match result collapses back to a scalar (breaking .Count/indexing) once the
-    # if-statement's output is captured by this assignment.
-    $results = @(if ($query) {
-        $scored = foreach ($app in $script:AppLauncherApps) {
-            $score = Get-FuzzyScore -Text $app.Name -Query $query
-            if ($null -ne $score) { [PSCustomObject]@{ App = $app; Score = $score } }
-        }
-        $scored | Sort-Object Score -Descending | Select-Object -First 20 -ExpandProperty App
-    } else {
-        $script:AppLauncherApps | Select-Object -First 20
-    })
-    $script:AppLauncherFiltered = $results
-    $listBox = $script:AppLauncherListBox
-    $listBox.BeginUpdate()
-    $listBox.Items.Clear()
-    foreach ($app in $results) { [void]$listBox.Items.Add($app.Name) }
-    if ($listBox.Items.Count -gt 0) { $listBox.SelectedIndex = 0 }
-    $listBox.EndUpdate()
-}
-
-function Close-AppLauncher {
-    if ($script:AppLauncherForm -and -not $script:AppLauncherForm.IsDisposed) {
-        $script:AppLauncherForm.Close()
-    }
-}
-
-function Invoke-AppLauncherLaunch {
-    $listBox = $script:AppLauncherListBox
-    if ($listBox.SelectedIndex -lt 0 -or $listBox.SelectedIndex -ge $script:AppLauncherFiltered.Count) { return }
-    $app = $script:AppLauncherFiltered[$listBox.SelectedIndex]
-    try {
-        # Classic shortcuts/exes report a real file path as AppID; Store/UWP apps report an
-        # AppUserModelID instead, which only shell:AppsFolder knows how to launch.
-        if (Test-Path -LiteralPath $app.AppID) {
-            Start-Process -FilePath $app.AppID
-        } else {
-            Start-Process "shell:AppsFolder\$($app.AppID)"
-        }
-    } catch {
-        Write-Log "App launcher failed to start '$($app.Name)': $_"
-    }
-    Close-AppLauncher
-}
-
-function Show-AppLauncher {
-    if ($script:AppLauncherForm -and -not $script:AppLauncherForm.IsDisposed) {
-        [Win32]::ForceForegroundWindow($script:AppLauncherForm.Handle)
-        $script:AppLauncherTextBox.Focus()
+function Start-AppLauncher {
+    $launcherPath = Join-Path $PSScriptRoot 'AppLauncher.ps1'
+    if (-not (Test-Path -LiteralPath $launcherPath)) {
+        Write-Log "App launcher script not found at '$launcherPath' - launcher disabled."
         return
     }
-
     try {
-        $script:AppLauncherApps = @(Get-StartApps | Where-Object { $_.Name -and $_.AppID } | Sort-Object Name)
+        $exePath = (Get-Process -Id $PID).Path
+        $script:AppLauncherProcess = Start-Process -FilePath $exePath -WindowStyle Hidden -PassThru -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$launcherPath`" -ParentPid $PID"
+        Write-Log "App launcher started (pid $($script:AppLauncherProcess.Id))." -Level Info
     } catch {
-        Write-Log "App launcher failed to enumerate installed apps: $_"
-        return
+        Write-Log "Failed to start app launcher: $_"
     }
+}
 
-    $screen = [System.Windows.Forms.Screen]::PrimaryScreen
-    $width = 520
-    $height = 360
+function Stop-AppLauncher {
+    if (-not $script:AppLauncherProcess) { return }
+    try {
+        if (-not $script:AppLauncherProcess.HasExited) { Stop-Process -Id $script:AppLauncherProcess.Id -Force -ErrorAction Stop }
+    } catch { Write-Log "Failed to stop app launcher: $_" }
+    $script:AppLauncherProcess = $null
+}
 
-    # Reuse the same config keys as the status bar so the launcher matches whatever
-    # theme is configured - computed independently of $script:StatusBarColors since
-    # that's only populated when ShowStatusBar is enabled.
-    $theme = @{
-        Background = ConvertTo-BarColor $script:Config.StatusBarBackColor ([System.Drawing.Color]::FromArgb(30, 30, 30))
-        Field      = ConvertTo-BarColor $script:Config.StatusBarBusyColor ([System.Drawing.Color]::FromArgb(45, 45, 45))
-        Text       = ConvertTo-BarColor $script:Config.StatusBarTextColor ([System.Drawing.Color]::White)
-        Accent     = ConvertTo-BarColor $script:Config.StatusBarActiveColor ([System.Drawing.Color]::FromArgb(0, 120, 215))
-    }
-    $script:AppLauncherTheme = $theme
-
-    $form = New-Object ClickThroughOverlayForm
-    $form.FormBorderStyle = 'None'
-    $form.StartPosition = 'Manual'
-    $form.ShowInTaskbar = $false
-    $form.TopMost = $true
-    # Handle Enter/Up/Down/Escape at the form level so they work whether the textbox
-    # or the listbox (e.g. after a mouse click) currently has focus.
-    $form.KeyPreview = $true
-    $form.BackColor = $theme.Background
-    $form.Bounds = [System.Drawing.Rectangle]::new(
-        $screen.Bounds.X + [int](($screen.Bounds.Width - $width) / 2),
-        $screen.Bounds.Y + [int](($screen.Bounds.Height - $height) / 3),
-        $width, $height)
-
-    $textBox = New-Object System.Windows.Forms.TextBox
-    $textBox.Dock = 'Top'
-    $textBox.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 14
-    $textBox.BackColor = $theme.Field
-    $textBox.ForeColor = $theme.Text
-    $textBox.BorderStyle = 'None'
-
-    $listBox = New-Object System.Windows.Forms.ListBox
-    $listBox.Dock = 'Fill'
-    $listBox.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 11
-    $listBox.BackColor = $theme.Background
-    $listBox.ForeColor = $theme.Text
-    $listBox.BorderStyle = 'None'
-    # Owner-draw so the selected row uses the theme's accent color instead of the
-    # default system highlight, to match the status bar's active-workspace color.
-    # ItemHeight isn't recalculated from Font once DrawMode is OwnerDrawFixed, so it
-    # must be set explicitly or rows stay at the pre-owner-draw default and clip text.
-    $listBox.DrawMode = 'OwnerDrawFixed'
-    $listBox.ItemHeight = $listBox.Font.Height + 8
-    $listBox.add_DrawItem({
-            param($sender, $e)
-            try {
-                if ($e.Index -lt 0) { return }
-                $selected = ($e.State -band [System.Windows.Forms.DrawItemState]::Selected) -ne 0
-                $backColor = if ($selected) { $script:AppLauncherTheme.Accent } else { $script:AppLauncherTheme.Background }
-                $backBrush = New-Object System.Drawing.SolidBrush $backColor
-                $e.Graphics.FillRectangle($backBrush, $e.Bounds)
-                $backBrush.Dispose()
-                $text = $sender.Items[$e.Index].ToString()
-                $textBrush = New-Object System.Drawing.SolidBrush $script:AppLauncherTheme.Text
-                $format = New-Object System.Drawing.StringFormat
-                $format.LineAlignment = [System.Drawing.StringAlignment]::Center
-                $textRect = [System.Drawing.RectangleF]::new($e.Bounds.X + 6, $e.Bounds.Y, $e.Bounds.Width - 6, $e.Bounds.Height)
-                $e.Graphics.DrawString($text, $e.Font, $textBrush, $textRect, $format)
-                $textBrush.Dispose()
-            } catch { Write-Log "App launcher draw item failed: $_" }
-        })
-
-    # Invisible buttons wired as AcceptButton/CancelButton - Enter isn't an "input key" for a
-    # single-line TextBox, so a plain KeyDown handler on it never sees Enter at all; this is
-    # the standard WinForms mechanism for a form-wide default/cancel action regardless of
-    # which control has focus.
-    $acceptButton = New-Object System.Windows.Forms.Button
-    $acceptButton.Size = New-Object System.Drawing.Size(0, 0)
-    $acceptButton.TabStop = $false
-    $acceptButton.add_Click({ try { Invoke-AppLauncherLaunch } catch { Write-Log "App launcher launch failed: $_" } })
-
-    $cancelButton = New-Object System.Windows.Forms.Button
-    $cancelButton.Size = New-Object System.Drawing.Size(0, 0)
-    $cancelButton.TabStop = $false
-    $cancelButton.add_Click({ try { Close-AppLauncher } catch { } })
-
-    $form.Controls.Add($listBox)
-    $form.Controls.Add($textBox)
-    $form.Controls.Add($acceptButton)
-    $form.Controls.Add($cancelButton)
-    $form.AcceptButton = $acceptButton
-    $form.CancelButton = $cancelButton
-    $script:AppLauncherForm = $form
-    $script:AppLauncherTextBox = $textBox
-    $script:AppLauncherListBox = $listBox
-    $script:AppLauncherFiltered = @()
-
-    $textBox.add_TextChanged({ try { Update-AppLauncherResults } catch { Write-Log "App launcher filter failed: $_" } })
-    $form.add_KeyDown({
-            param($sender, $e)
-            try {
-                switch ($e.KeyCode) {
-                    'Down' {
-                        if ($script:AppLauncherListBox.SelectedIndex -lt $script:AppLauncherListBox.Items.Count - 1) { $script:AppLauncherListBox.SelectedIndex++ }
-                        $e.Handled = $true; $e.SuppressKeyPress = $true
-                    }
-                    'Up' {
-                        if ($script:AppLauncherListBox.SelectedIndex -gt 0) { $script:AppLauncherListBox.SelectedIndex-- }
-                        $e.Handled = $true; $e.SuppressKeyPress = $true
-                    }
-                }
-            } catch { Write-Log "App launcher key handling failed: $_" }
-        })
-    $listBox.add_MouseDoubleClick({ try { Invoke-AppLauncherLaunch } catch { Write-Log "App launcher launch failed: $_" } })
-    $form.add_Deactivate({ try { Close-AppLauncher } catch { } })
-    $form.add_FormClosed({ $script:AppLauncherForm = $null })
-    # Plain Activate()/Focus() often only flashes the taskbar entry instead of actually
-    # focusing the window when opened from a global hotkey - force it, then focus the textbox.
-    $form.add_Shown({
-            try {
-                [Win32]::ForceForegroundWindow($script:AppLauncherForm.Handle)
-                if ($script:AppLauncherTextBox -and -not $script:AppLauncherTextBox.IsDisposed) { $script:AppLauncherTextBox.Focus() }
-            } catch { Write-Log "App launcher focus failed: $_" }
-        })
-
-    Update-AppLauncherResults
-    $form.Show()
-    [Win32]::ForceForegroundWindow($form.Handle)
+function Test-AppLauncherForeground {
+    $fg = [Win32]::GetForegroundWindow()
+    return $fg -ne [IntPtr]::Zero -and [Win32]::GetTitle($fg) -eq $script:AppLauncherWindowTitle
 }
 
 # ---------------------------------------------------------------------------
@@ -1490,116 +1574,6 @@ function Move-FocusedWindowToWorkspace {
     Invoke-DelayedRelayout
 }
 
-# ---------------------------------------------------------------------------
-# State persistence (workspace assignments + per-workspace master ratios)
-# ---------------------------------------------------------------------------
-
-function Save-TilingWMState {
-    # Hwnds aren't stable across restarts, so windows are keyed by (process name, title)
-    # instead - good enough to reunite most windows with their workspace after a relaunch.
-    $windows = foreach ($hwnd in $script:WindowWorkspace.Keys) {
-        $procId = 0
-        [Win32]::GetWindowThreadProcessId($hwnd, [ref]$procId) | Out-Null
-        try { $procName = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch { continue }
-        $title = [Win32]::GetTitle($hwnd)
-        if (-not $procName -or -not $title) { continue }
-        [PSCustomObject]@{
-            ProcessName = $procName
-            Title       = $title
-            Workspace   = $script:WindowWorkspace[$hwnd]
-        }
-    }
-
-    $state = [PSCustomObject]@{
-        ActiveWorkspace      = $script:ActiveWorkspace
-        WorkspaceMasterRatio = $script:WorkspaceMasterRatio
-        Windows              = @($windows)
-    }
-    try {
-        $state | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:StatePath -Encoding UTF8 -ErrorAction Stop
-    } catch {
-        Write-Log "Failed to save state to '$script:StatePath': $_"
-    }
-}
-
-function Restore-TilingWMState {
-    if (-not (Test-Path -LiteralPath $script:StatePath)) { return }
-    try {
-        $state = Get-Content -LiteralPath $script:StatePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-    } catch {
-        Write-Log "Failed to load saved state from '$script:StatePath': $_"
-        return
-    }
-
-    if ($state.ActiveWorkspace) { $script:ActiveWorkspace = [int]$state.ActiveWorkspace }
-
-    $script:WorkspaceMasterRatio = @{}
-    if ($state.WorkspaceMasterRatio) {
-        foreach ($prop in $state.WorkspaceMasterRatio.PSObject.Properties) {
-            $script:WorkspaceMasterRatio[$prop.Name] = [double]$prop.Value
-        }
-    }
-    if (-not $state.Windows) { return }
-
-    # Match saved (process, title) records against the currently-open windows. Exact
-    # title matches are claimed first; any leftover windows for a process fall back to
-    # its next unclaimed record, so an app with multiple windows still gets *a* workspace.
-    $pending = New-Object 'System.Collections.Generic.List[object]'
-    foreach ($w in @($state.Windows)) { $pending.Add($w) }
-
-    foreach ($hwnd in [Win32]::GetTopLevelWindows()) {
-        if ($hwnd -eq $script:HotKeyWindowHandle) { continue }
-        if ([Win32]::GetWindowTextLength($hwnd) -eq 0) { continue }
-        $title = [Win32]::GetTitle($hwnd)
-        $procId = 0
-        [Win32]::GetWindowThreadProcessId($hwnd, [ref]$procId) | Out-Null
-        try { $procName = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch { continue }
-
-        $match = $pending | Where-Object { $_.ProcessName -eq $procName -and $_.Title -eq $title } | Select-Object -First 1
-        if (-not $match) { $match = $pending | Where-Object { $_.ProcessName -eq $procName } | Select-Object -First 1 }
-        if ($match) {
-            $script:WindowWorkspace[$hwnd] = [int]$match.Workspace
-            [void]$pending.Remove($match)
-        }
-    }
-}
-
-# ---------------------------------------------------------------------------
-# Hotkey string parsing, e.g. "Alt+Shift+J" -> modifiers + virtual key code
-# ---------------------------------------------------------------------------
-
-function ConvertTo-HotKeySpec {
-    param([string]$Spec)
-
-    $parts = $Spec -split '\+'
-    $key = $parts[-1].Trim()
-    $mods = $parts[0..($parts.Count - 2)]
-    $modFlags = 0
-    foreach ($m in $mods) {
-        switch ($m.Trim().ToLower()) {
-            'alt' { $modFlags = $modFlags -bor 0x1 }
-            'ctrl' { $modFlags = $modFlags -bor 0x2 }
-            'control' { $modFlags = $modFlags -bor 0x2 }
-            'shift' { $modFlags = $modFlags -bor 0x4 }
-            'win' { $modFlags = $modFlags -bor 0x8 }
-            default { throw "Unknown modifier '$m' in hotkey spec '$Spec'" }
-        }
-    }
-    $modFlags = $modFlags -bor 0x4000 # MOD_NOREPEAT
-
-    $keyMap = @{ 'Enter' = 0x0D; 'Space' = 0x20; 'Tab' = 0x09; 'Escape' = 0x1B; 'Esc' = 0x1B; 'Left' = 0x25; 'Up' = 0x26; 'Right' = 0x27; 'Down' = 0x28; '[' = 0xDB; ']' = 0xDD }
-    if ($keyMap.ContainsKey($key)) {
-        $vk = $keyMap[$key]
-    } elseif ($key.Length -eq 1) {
-        $vk = [byte][char]$key.ToUpper()
-    } elseif ($key -match '^[Ff](\d{1,2})$') {
-        $vk = 0x70 + [int]$Matches[1] - 1
-    } else {
-        throw "Unknown key '$key' in hotkey spec '$Spec'"
-    }
-
-    [PSCustomObject]@{ Modifiers = [uint32]$modFlags; VirtualKey = [uint32]$vk }
-}
 
 # ---------------------------------------------------------------------------
 # Main entry point
@@ -1609,12 +1583,10 @@ $hotkeyWindow = New-Object HotKeyWindow
 $null = $hotkeyWindow.Handle # force handle creation so RegisterHotKey has a target
 $script:HotKeyWindowHandle = $hotkeyWindow.Handle
 
-# Restore workspace assignments/ratios from the last clean shutdown, if any, before the
-# first Update-WindowSets pass so restored windows are hidden/shown correctly right away.
-try { Restore-TilingWMState } catch { Write-Log "Failed to restore state: $_" }
-
 $nextId = 1
 foreach ($name in $script:Config.HotKeys.Keys) {
+    # AppLauncher.ps1 registers this one itself - see Start-AppLauncher.
+    if ($name -eq 'AppLauncher') { continue }
     try {
         $spec = ConvertTo-HotKeySpec -Spec $script:Config.HotKeys[$name]
         $id = $nextId
@@ -1680,7 +1652,6 @@ $hotkeyWindow.add_HotKeyPressed({
                 'FloatingToFront' { Invoke-BringFloatingToFront }
                 'Retile' { Update-WindowSets -Force }
                 'Quit' { Invoke-Quit }
-                'AppLauncher' { Show-AppLauncher }
                 'Restart' { Invoke-Restart }
             }
         } catch { Write-Log "Hotkey action '$action' failed: $_" }
@@ -1690,11 +1661,15 @@ $trayIcon = New-Object System.Windows.Forms.NotifyIcon
 $trayIcon.Visible = $true
 $trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
 [void]$trayMenu.Items.Add('Retile now', $null, { try { Update-WindowSets -Force } catch { Write-Log "Retile now failed: $_" } })
+# Dumps the current screen/window geometry to TilingWM.log - click this while a layout
+# problem is on screen, before retiling or restarting destroys the evidence.
+[void]$trayMenu.Items.Add('Log diagnostic snapshot', $null, { try { Write-DiagnosticSnapshot -Reason 'tray menu' } catch { Write-Log "Diagnostic snapshot failed: $_" } })
 [void]$trayMenu.Items.Add('Restart', $null, { try { Invoke-Restart } catch { Write-Log "Restart failed: $_" } })
 [void]$trayMenu.Items.Add('Exit', $null, { try { Invoke-Quit } catch { Write-Log "Exit failed: $_" } })
 $trayIcon.ContextMenuStrip = $trayMenu
 Set-TrayWorkspaceIcon -Workspace $script:ActiveWorkspace
 
+if ($script:Config.HotKeys.AppLauncher) { Start-AppLauncher }
 if ($script:Config.ShowStatusBar) { Initialize-StatusBar }
 if ($script:Config.HideTaskbar) { Set-TaskbarVisible -Visible $false }
 
@@ -1734,40 +1709,33 @@ $script:MoveSizeEndProc = {
 # EVENT_SYSTEM_MOVESIZEEND = 0x000B for both eventMin/eventMax - only that one event.
 $script:MoveSizeEndHook = [Win32]::SetWinEventHook(0x000B, 0x000B, [IntPtr]::Zero, $script:MoveSizeEndProc, 0, 0, 0)
 
-# TEMPORARY diagnostic for the "top-right deadzone" report - logs every system-wide foreground
-# change (millisecond timestamp + hwnd/class/title/process) so a repro can be matched up against
-# what actually stole/ate focus. Safe to remove once root-caused; harmless otherwise.
-$script:ForegroundChangeProc = {
-    param($hWinEventHook, $eventType, $hwnd, $idObject, $idChild, $dwEventThread, $dwmsEventTime)
-    try {
-        if ($idObject -ne 0 -or $hwnd -eq [IntPtr]::Zero) { return } # OBJID_WINDOW only
-        $procId = 0
-        [Win32]::GetWindowThreadProcessId($hwnd, [ref]$procId) | Out-Null
-        try { $procName = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch { $procName = '?' }
-        $ts = Get-Date -Format 'HH:mm:ss.fff'
-        Write-Log "[$ts] FG-> hwnd=$hwnd class=$([Win32]::GetClass($hwnd)) title='$([Win32]::GetTitle($hwnd))' proc=$procName" -Level Info
-    } catch { Write-Log "Foreground-change diagnostic hook failed: $_" }
-}
-# EVENT_SYSTEM_FOREGROUND = 0x0003 for both eventMin/eventMax - only that one event.
-$script:ForegroundChangeHook = [Win32]::SetWinEventHook(0x0003, 0x0003, [IntPtr]::Zero, $script:ForegroundChangeProc, 0, 0, 0)
+# Window show/hide/minimize/cloak events trigger an immediate (debounced) rescan, so new and
+# closed windows tile right away; the poll timer above is just a safety net for anything
+# these events miss (e.g. a window that only gets its title after it's shown).
+$script:WindowWatcher = New-Object WindowChangeWatcher -ArgumentList 60, 250
+$script:WindowWatcher.add_Changed({
+        try { Update-WindowSets; Update-StatusBarContent } catch { Write-Log "Window-change rescan failed: $_" }
+    })
+$script:WindowWatcher.Start()
 
 Update-WindowSets -Force
 Update-StatusBarContent
 $timer.Start()
 if ($script:Config.FocusFollowsMouse) { $mouseTimer.Start() }
 
+Write-Log "PS Tiling Manager starting (pid $PID, $($PSVersionTable.PSVersion), logLevel=$($script:Config.LogLevel))" -Level Info
+Write-DiagnosticSnapshot -Reason 'startup'
 Write-Log "PS Tiling Manager running. Press Alt+Shift+E (or use the tray icon) to quit." -Level Info
 
 try {
     [System.Windows.Forms.Application]::Run($hotkeyWindow)
 } finally {
-    try { Save-TilingWMState } catch { Write-Log "Failed to save state: $_" }
     $timer.Stop()
     $timer.Dispose()
     $mouseTimer.Stop()
     $mouseTimer.Dispose()
     if ($script:MoveSizeEndHook -and $script:MoveSizeEndHook -ne [IntPtr]::Zero) { [Win32]::UnhookWinEvent($script:MoveSizeEndHook) | Out-Null }
-    if ($script:ForegroundChangeHook -and $script:ForegroundChangeHook -ne [IntPtr]::Zero) { [Win32]::UnhookWinEvent($script:ForegroundChangeHook) | Out-Null }
+    if ($script:WindowWatcher) { $script:WindowWatcher.Dispose() }
     # Un-hide anything parked on an inactive fake workspace so it can't be stranded when we quit.
     foreach ($hwnd in $script:WindowWorkspace.Keys) {
         [Win32]::ShowWindow($hwnd, 8) | Out-Null # SW_SHOWNA
@@ -1785,10 +1753,8 @@ try {
     if ($script:PowerMenuDismissTimer) { $script:PowerMenuDismissTimer.Stop(); $script:PowerMenuDismissTimer.Dispose() }
     if ($script:PowerMenu -and -not $script:PowerMenu.IsDisposed) { $script:PowerMenu.Dispose() }
     if ($script:PowerMenuForm -and -not $script:PowerMenuForm.IsDisposed) { $script:PowerMenuForm.Dispose() }
-    if ($script:AppLauncherForm -and -not $script:AppLauncherForm.IsDisposed) { $script:AppLauncherForm.Dispose() }
+    Stop-AppLauncher
     if (-not $hotkeyWindow.IsDisposed) { $hotkeyWindow.Dispose() }
-    # Marker for Watch-TilingWM.ps1: its presence (with a fresh timestamp) means this was a
-    # normal shutdown - a crash or a hard kill (Stop-Process -Force/Task Manager) never
-    # reaches this finally block, so its absence is what flags an abnormal stop.
-    try { Set-Content -LiteralPath (Join-Path $PSScriptRoot 'TilingWM.stopped') -Value (Get-Date -Format 'o') -ErrorAction Stop } catch { }
+    try { $script:InstanceMutex.ReleaseMutex() } catch { }
+    $script:InstanceMutex.Dispose()
 }

@@ -5,7 +5,13 @@
 @{
     Gap                = 8      # pixels between tiled windows and screen edges
     MasterRatio        = 0.55   # fraction of monitor width given to the master pane
-    PollIntervalMs     = 400    # how often (ms) to scan for new/closed windows
+    PollIntervalMs     = 1000   # safety-net rescan (ms); window show/hide events already retile immediately
+
+    # 'Warning' = problems only, 'Info' = + lifecycle/diagnostic snapshots,
+    # 'Debug' = + every tile placement and computed layout area (verbose, but what you
+    # want enabled while chasing a layout bug like "only half the screen is usable").
+    LogLevel           = 'Info'
+    LogMaxSizeKB       = 2048   # TilingWM.log (in %LOCALAPPDATA%\power-tile) rolls over to TilingWM.log.1 past this size
 
     FocusFollowsMouse       = $true  # hover a tiled window to focus it, no click needed
     FocusFollowsMousePollMs = 100    # how often (ms) to check the cursor position

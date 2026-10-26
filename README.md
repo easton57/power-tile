@@ -6,7 +6,7 @@ Power tile is a PowerShell tiling window manager for those poor souls stuck on a
 
 ## Features
 
-* Automatic master-stack tiling with configurable gaps and master ratio
+* Automatic master-stack tiling with configurable gaps and master ratio; new, closed, and minimized windows retile immediately
 * Nine simulated workspaces with configurable navigation and window-movement hotkeys
 * Focus-follows-mouse and keyboard-driven focus, movement, resizing, and floating controls
 * A fuzzy application launcher because the Start menu, after all these years, is still hot garbage
@@ -26,6 +26,20 @@ powershell.exe -ExecutionPolicy Bypass -File .\TilingWM.ps1
 ```
 
 Run PowerShell as administrator if you also want power-tile to manage elevated windows.
+
+### Application launcher
+
+The fuzzy launcher is a separate script, `AppLauncher.ps1`. `TilingWM.ps1` starts it automatically and stops it on exit; it also exits on its own if the tiling manager crashes. Because it runs in its own process and owns its hotkey, it opens instantly and reliably takes focus even while the tiling manager is busy. It can also be run on its own:
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\AppLauncher.ps1
+```
+
+Type to filter (prefix, word initials such as `vsc`, substring, then loose matches), use `Up`/`Down` or `Ctrl+N`/`Ctrl+P` to select, `Enter` to launch, and `Escape` or the hotkey again to close. Frequently launched apps are ranked higher. Remove `AppLauncher` from the `HotKeys` table to disable it.
+
+### Logs and state
+
+Logs (`TilingWM.log`, `AppLauncher.log`) and the launcher's history (`AppLauncher.history.json`) are written to `%LOCALAPPDATA%\power-tile`, not the repository folder. Only one instance of power-tile runs at a time; starting a second copy exits it with a note in the log.
 
 ## Configuration
 
