@@ -30,15 +30,29 @@ $script:DataDir = Get-PowerTileDataDirectory
 $script:LogPath = Join-Path $script:DataDir 'AppLauncher.log'
 $script:HistoryPath = Join-Path $script:DataDir 'AppLauncher.history.json'
 
+$script:LogWriter = $null
+$script:LogWriteCount = 0
+
 function Write-Log {
     param([string]$Message)
     try {
-        $existing = Get-Item -LiteralPath $script:LogPath -ErrorAction SilentlyContinue
-        if ($existing -and $existing.Length -gt 512KB) {
-            Move-Item -LiteralPath $script:LogPath -Destination "$($script:LogPath).1" -Force -ErrorAction Stop
+        if (-not $script:LogWriter) {
+            # One handle for the life of the process - Add-Content re-opens the file (and
+            # re-triggers the AV filter driver on a managed machine) for every single line.
+            # Shared read/write so an overlapping restart can't lock the other one out.
+            $stream = New-Object System.IO.FileStream($script:LogPath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+            $script:LogWriter = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
+            $script:LogWriter.AutoFlush = $true
         }
+        $script:LogWriteCount++
+        if (($script:LogWriteCount % 50) -eq 0 -and $script:LogWriter.BaseStream.Length -gt 512KB) {
+            $script:LogWriter.Dispose()
+            $script:LogWriter = $null
+            Move-Item -LiteralPath $script:LogPath -Destination "$($script:LogPath).1" -Force -ErrorAction Stop
+            return
+        }
+        $script:LogWriter.WriteLine("[$([datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss.fff'))] $Message")
     } catch { }
-    try { Add-Content -LiteralPath $script:LogPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] $Message" -ErrorAction Stop } catch { }
 }
 
 # ---------------------------------------------------------------------------
@@ -90,7 +104,9 @@ Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 if (-not ('LauncherForm' -as [type])) {
     Add-Type -ReferencedAssemblies 'System.Windows.Forms', 'System.Drawing' -TypeDefinition @'
 using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Windows.Forms;
 
 public static class LauncherNative
@@ -133,9 +149,151 @@ public static class LauncherNative
     }
 }
 
+// Ranking runs on every keystroke over every installed app (hundreds of them on a corporate
+// image). In PowerShell that meant a function call plus several string allocations per app
+// per character typed, which is exactly where the launcher felt sluggish - so the scoring
+// lives here, over a lowercase/initials index that's built once per app-list refresh.
+public static class FuzzyMatcher
+{
+    static string[] lowered = new string[0];
+    static string[] initials = new string[0];
+
+    public static void SetItems(string[] items)
+    {
+        string[] source = items ?? new string[0];
+        lowered = new string[source.Length];
+        initials = new string[source.Length];
+        var sb = new StringBuilder(32);
+        for (int i = 0; i < source.Length; i++)
+        {
+            string lower = (source[i] ?? "").ToLowerInvariant();
+            lowered[i] = lower;
+            sb.Length = 0;
+            bool atWordStart = true;
+            foreach (char c in lower)
+            {
+                if (c == ' ' || c == '-' || c == '_' || c == '.') { atWordStart = true; continue; }
+                if (atWordStart) { sb.Append(c); atWordStart = false; }
+            }
+            initials[i] = sb.ToString();
+        }
+    }
+
+    // Returns the indices of the best matches, highest score first. An empty query matches
+    // everything, so the frequency boost (and then the caller's original order) decides.
+    public static int[] Rank(string query, int[] boosts, int max)
+    {
+        string q = (query ?? "").ToLowerInvariant();
+        var order = new List<int>();
+        var keys = new List<long>();
+        for (int i = 0; i < lowered.Length; i++)
+        {
+            int score;
+            if (q.Length == 0) score = 0;
+            else if (!TryScore(lowered[i], initials[i], q, out score)) continue;
+            if (boosts != null && i < boosts.Length) score += boosts[i];
+            // Negated score in the high word, index in the low word: one ascending sort then
+            // gives best-first, with equal scores left in the caller's (alphabetical) order.
+            keys.Add(((long)(-score) << 32) | (uint)i);
+            order.Add(i);
+        }
+
+        int[] result = order.ToArray();
+        long[] sortKeys = keys.ToArray();
+        Array.Sort(sortKeys, result);
+        if (result.Length <= max) return result;
+        var top = new int[max];
+        Array.Copy(result, top, max);
+        return top;
+    }
+
+    // Prefix > word initials ("vsc" -> Visual Studio Code) > substring > in-order subsequence.
+    static bool TryScore(string text, string textInitials, string query, out int score)
+    {
+        score = 0;
+        if (text.StartsWith(query, StringComparison.Ordinal)) { score = 1000 - text.Length; return true; }
+        if (query.Length > 1 && textInitials.StartsWith(query, StringComparison.Ordinal)) { score = 800 - text.Length; return true; }
+        int idx = text.IndexOf(query, StringComparison.Ordinal);
+        if (idx >= 0) { score = 500 - idx; return true; }
+        int from = 0;
+        int total = 0;
+        foreach (char c in query)
+        {
+            int found = text.IndexOf(c, from);
+            if (found < 0) return false;
+            total += 100 - found;
+            from = found + 1;
+        }
+        score = total;
+        return true;
+    }
+}
+
 public class LauncherForm : Form
 {
     public event EventHandler HotKeyPressed;
+    public event EventHandler ClickedOutside;
+
+    // A low-level mouse hook (installed only while the launcher is open) is the one reliable way
+    // to see every click outside it - including on windows that never take focus, like the
+    // power-tile status bar, where no Deactivate ever fires. Done in C# because the callback
+    // runs for every mouse event system-wide and must return quickly.
+    delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct MSLLHOOKSTRUCT { public int x; public int y; public uint mouseData; public uint flags; public uint time; public IntPtr dwExtraInfo; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc fn, IntPtr hMod, uint threadId);
+    [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hhk);
+    [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] static extern IntPtr GetModuleHandle(string name);
+
+    LowLevelMouseProc mouseProc;
+    IntPtr mouseHook = IntPtr.Zero;
+
+    public void StartClickWatch()
+    {
+        if (mouseHook != IntPtr.Zero) return;
+        if (mouseProc == null) mouseProc = MouseHookProc; // must stay referenced while hooked
+        mouseHook = SetWindowsHookEx(14, mouseProc, GetModuleHandle(null), 0); // WH_MOUSE_LL
+    }
+
+    public void StopClickWatch()
+    {
+        if (mouseHook == IntPtr.Zero) return;
+        UnhookWindowsHookEx(mouseHook);
+        mouseHook = IntPtr.Zero;
+    }
+
+    IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0)
+        {
+            int msg = wParam.ToInt32();
+            // WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_XBUTTONDOWN
+            if (msg == 0x0201 || msg == 0x0204 || msg == 0x0207 || msg == 0x020B)
+            {
+                var p = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+                RECT r;
+                if (GetWindowRect(Handle, out r) && (p.x < r.Left || p.x >= r.Right || p.y < r.Top || p.y >= r.Bottom))
+                {
+                    // Raise after returning - the click itself still goes through to its target.
+                    BeginInvoke(new MethodInvoker(() => { var h = ClickedOutside; if (h != null) h(this, EventArgs.Empty); }));
+                }
+            }
+        }
+        return CallNextHookEx(mouseHook, nCode, wParam, lParam);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        StopClickWatch();
+        base.Dispose(disposing);
+    }
 
     protected override CreateParams CreateParams
     {
@@ -176,6 +334,7 @@ function ConvertTo-Color {
 # ---------------------------------------------------------------------------
 
 $script:Apps = @()
+$script:Boosts = New-Object 'int[]' 0 # launch-frequency boost per app, aligned with $script:Apps
 $script:AppsLoadedAt = [datetime]::MinValue
 $script:AppRefreshPs = $null
 $script:AppRefreshHandle = $null
@@ -210,6 +369,8 @@ function Complete-AppListRefresh {
         if ($result.Count -gt 0) {
             $script:Apps = $result
             $script:AppsLoadedAt = Get-Date
+            [FuzzyMatcher]::SetItems([string[]]($script:Apps | ForEach-Object { $_.Name }))
+            Update-HistoryBoosts
             if ($script:Form.Visible) { Update-Results }
         }
     } catch {
@@ -219,32 +380,15 @@ function Complete-AppListRefresh {
     }
 }
 
-function Get-FuzzyScore {
-    # Higher is better; $null means no match. Prefix > word-initials ("vsc" -> Visual Studio
-    # Code) > substring > in-order subsequence.
-    param([string]$Text, [string]$Query)
-    $t = $Text.ToLowerInvariant()
-    $q = $Query.ToLowerInvariant()
-    if ($t.StartsWith($q)) { return 1000 - $t.Length }
-    $initials = -join ($t -split '[\s\-_.]+' | Where-Object { $_ } | ForEach-Object { $_[0] })
-    if ($q.Length -gt 1 -and $initials.StartsWith($q)) { return 800 - $t.Length }
-    $idx = $t.IndexOf($q)
-    if ($idx -ge 0) { return 500 - $idx }
-    $searchFrom = 0
-    $score = 0
-    foreach ($c in $q.ToCharArray()) {
-        $found = $t.IndexOf($c, $searchFrom)
-        if ($found -lt 0) { return $null }
-        $score += (100 - $found)
-        $searchFrom = $found + 1
+function Update-HistoryBoosts {
+    # Frequency boosts, kept as a plain int[] aligned with $script:Apps so ranking never has
+    # to walk the history hashtable per app per keystroke.
+    $boosts = New-Object 'int[]' $script:Apps.Count
+    for ($i = 0; $i -lt $script:Apps.Count; $i++) {
+        $id = $script:Apps[$i].AppID
+        if ($script:History.ContainsKey($id)) { $boosts[$i] = [Math]::Min($script:History[$id], 20) * 15 }
     }
-    return $score
-}
-
-function Get-HistoryBoost {
-    param([string]$AppID)
-    if ($script:History.ContainsKey($AppID)) { return [Math]::Min($script:History[$AppID], 20) * 15 }
-    return 0
+    $script:Boosts = $boosts
 }
 
 # ---------------------------------------------------------------------------
@@ -333,18 +477,8 @@ $script:LoadingText = 'Loading apps...'
 
 function Update-Results {
     $query = $script:TextBox.Text.Trim()
-    # The outer @() must wrap the whole if/else so a single match stays an array.
-    $results = @(if ($query) {
-            $scored = foreach ($app in $script:Apps) {
-                $score = Get-FuzzyScore -Text $app.Name -Query $query
-                if ($null -ne $score) { [PSCustomObject]@{ App = $app; Score = $score + (Get-HistoryBoost $app.AppID) } }
-            }
-            $scored | Sort-Object Score -Descending | Select-Object -First 30 -ExpandProperty App
-        } else {
-            $script:Apps |
-                Sort-Object @{ Expression = { Get-HistoryBoost $_.AppID }; Descending = $true }, Name |
-                Select-Object -First 30
-        })
+    $indices = [FuzzyMatcher]::Rank($query, $script:Boosts, 30)
+    $results = @(foreach ($i in $indices) { $script:Apps[$i] })
     $script:Filtered = $results
     $lb = $script:ListBox
     $lb.BeginUpdate()
@@ -359,8 +493,30 @@ function Update-Results {
 }
 
 function Hide-Launcher {
+    $script:DismissTimer.Stop()
+    $script:Form.StopClickWatch()
     if ($script:Form.Visible) { $script:Form.Hide() }
 }
+
+# Deactivate alone misses some ways of losing the launcher: focus being taken before its own
+# activation finished left it visible but unfocused, so only Escape-after-refocusing closed
+# it. Poll while it's open and dismiss once focus is gone (clicks outside it - including on
+# windows that never take focus - are caught by the ClickedOutside mouse hook instead).
+function Test-LauncherDismiss {
+    $elapsed = ((Get-Date) - $script:ShownAt).TotalMilliseconds
+    if ($elapsed -lt 300) { return }
+    if ([LauncherNative]::GetForegroundWindow() -eq $script:Form.Handle) { return }
+    if ($script:WasActivated -or $elapsed -gt 1500) {
+        Hide-Launcher
+    } else {
+        # Never got focus in the first place - keep trying briefly before giving up.
+        if ([LauncherNative]::Activate($script:Form.Handle)) { $script:TextBox.Focus() | Out-Null }
+    }
+}
+
+$script:DismissTimer = New-Object System.Windows.Forms.Timer
+$script:DismissTimer.Interval = 100
+$script:DismissTimer.add_Tick({ try { Test-LauncherDismiss } catch { Write-Log "Dismiss check failed: $_" } })
 
 function Show-Launcher {
     $screen = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position)
@@ -371,12 +527,15 @@ function Show-Launcher {
     $script:TextBox.Text = ''
     Update-Results
     $script:ShownAt = Get-Date
+    $script:WasActivated = $false
     $script:Form.Show()
     $script:Form.Activate()
     if (-not [LauncherNative]::Activate($script:Form.Handle)) {
         Write-Log "Could not take foreground (fg=$([LauncherNative]::GetForegroundWindow()))."
     }
     $script:TextBox.Focus() | Out-Null
+    $script:DismissTimer.Start()
+    $script:Form.StartClickWatch()
     if (((Get-Date) - $script:AppsLoadedAt).TotalSeconds -gt 60) { Start-AppListRefresh }
 }
 
@@ -396,6 +555,7 @@ function Invoke-Launch {
             Start-Process -FilePath "shell:AppsFolder\$($app.AppID)"
         }
         $script:History[$app.AppID] = 1 + $(if ($script:History.ContainsKey($app.AppID)) { $script:History[$app.AppID] } else { 0 })
+        Update-HistoryBoosts
         try { $script:History | ConvertTo-Json -Compress | Set-Content -LiteralPath $script:HistoryPath -ErrorAction Stop } catch { Write-Log "Failed to save launch history: $_" }
     } catch {
         Write-Log "Failed to start '$($app.Name)' ($($app.AppID)): $_"
@@ -426,6 +586,8 @@ $form.add_KeyDown({
     })
 # Click-away closes it, like a Start menu. Activation can bounce for a moment while taking the
 # foreground from another app; within that grace window, grab focus back instead of closing.
+$form.add_Activated({ $script:WasActivated = $true })
+$form.add_ClickedOutside({ try { Hide-Launcher } catch { Write-Log "Click-outside handling failed: $_" } })
 $form.add_Deactivate({
         try {
             if (((Get-Date) - $script:ShownAt).TotalMilliseconds -lt 400) {
@@ -477,8 +639,9 @@ if ($ParentPid -gt 0) {
 
 # Polls the background app-list refresh, and exits if the WM that started us has gone away
 # (covers a crash or hard kill, where TilingWM.ps1 never gets to stop this process itself).
+# Deliberately lazy: this runs for the whole session, and nothing here is time-critical.
 $timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = 250
+$timer.Interval = 1000
 $timer.add_Tick({
         try {
             Complete-AppListRefresh
@@ -504,4 +667,5 @@ try {
     try { $script:Mutex.ReleaseMutex() } catch { }
     $script:Mutex.Dispose()
     Write-Log "Launcher stopped."
+    if ($script:LogWriter) { try { $script:LogWriter.Dispose() } catch { } }
 }

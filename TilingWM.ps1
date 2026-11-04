@@ -62,12 +62,21 @@ Import-Module (Join-Path $PSScriptRoot 'PowerTile.Common.psm1') -Force -DisableN
 $script:DataDir = Get-PowerTileDataDirectory
 $script:LogPath = Join-Path $script:DataDir 'TilingWM.log'
 $script:LogLevelRank = @{ Debug = 0; Info = 1; Warning = 2 }
+# Info-and-above until the config is loaded; resolved once there rather than on every call.
+$script:LogMinRank = 1
+$script:LogDebugEnabled = $false
+$script:LogMaxBytes = 2MB
+$script:LogWriter = $null
+$script:LogWriteCount = 0
+
+function Close-LogWriter {
+    if ($script:LogWriter) { try { $script:LogWriter.Dispose() } catch { } }
+    $script:LogWriter = $null
+}
+
 function Write-Log {
     param([string]$Message, [ValidateSet('Debug', 'Info', 'Warning')][string]$Level = 'Warning')
-    # Config isn't loaded yet for the earliest calls, so default to Info-and-above.
-    $minLevel = if ($script:Config -and $script:Config.LogLevel) { [string]$script:Config.LogLevel } else { 'Info' }
-    if (-not $script:LogLevelRank.ContainsKey($minLevel)) { $minLevel = 'Info' }
-    if ($script:LogLevelRank[$Level] -lt $script:LogLevelRank[$minLevel]) { return }
+    if ($script:LogLevelRank[$Level] -lt $script:LogMinRank) { return }
 
     switch ($Level) {
         'Warning' { Write-Warning $Message }
@@ -77,13 +86,20 @@ function Write-Log {
     try {
         # Debug logging is chatty enough to fill a disk over weeks of uptime - roll the file
         # over once instead of truncating, so the run leading up to a crash is still readable.
-        $maxBytes = 1024 * [int]$(if ($script:Config -and $script:Config.LogMaxSizeKB) { $script:Config.LogMaxSizeKB } else { 2048 })
-        $existing = Get-Item -LiteralPath $script:LogPath -ErrorAction SilentlyContinue
-        if ($existing -and $existing.Length -gt $maxBytes) {
+        $script:LogWriteCount++
+        if ($script:LogWriter -and ($script:LogWriteCount % 100) -eq 0 -and $script:LogWriter.BaseStream.Length -gt $script:LogMaxBytes) {
+            Close-LogWriter
             Move-Item -LiteralPath $script:LogPath -Destination "$($script:LogPath).1" -Force -ErrorAction Stop
         }
+        if (-not $script:LogWriter) {
+            # Kept open: Add-Content reopens the file per line, and AV scanning makes that slow.
+            # Shared so an overlapping restart, or tailing the log, can still write/read it.
+            $stream = New-Object System.IO.FileStream($script:LogPath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+            $script:LogWriter = New-Object System.IO.StreamWriter($stream, (New-Object System.Text.UTF8Encoding($false)))
+            $script:LogWriter.AutoFlush = $true
+        }
+        $script:LogWriter.WriteLine("[$([datetime]::Now.ToString('yyyy-MM-dd HH:mm:ss.fff'))] [$($Level.Substring(0,1))] $Message")
     } catch { }
-    try { Add-Content -LiteralPath $script:LogPath -Value "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff')] [$($Level.Substring(0,1))] $Message" -ErrorAction Stop } catch { }
 }
 
 # ---------------------------------------------------------------------------
@@ -188,6 +204,9 @@ if (Test-Path $configPath) {
         Write-Log "Failed to load config file '$configPath': $_. Using defaults."
     }
 }
+if ($script:LogLevelRank.ContainsKey([string]$script:Config.LogLevel)) { $script:LogMinRank = $script:LogLevelRank[[string]$script:Config.LogLevel] }
+$script:LogDebugEnabled = $script:LogMinRank -le 0
+if ($script:Config.LogMaxSizeKB) { $script:LogMaxBytes = 1KB * [int]$script:Config.LogMaxSizeKB }
 
 # ---------------------------------------------------------------------------
 # Win32 interop
@@ -390,6 +409,65 @@ public class Win32
         return sb.ToString();
     }
 
+    // Keeps enumeration (z-)order. Invisible untracked windows - the vast majority - can't
+    // affect a rescan, and skipping them here saves a PowerShell loop iteration each.
+    public static List<IntPtr> VisibleOrTracked(List<IntPtr> all, HashSet<IntPtr> tracked)
+    {
+        var result = new List<IntPtr>();
+        foreach (IntPtr h in all)
+            if (IsWindowVisible(h) || tracked.Contains(h)) result.Add(h);
+        return result;
+    }
+
+    [DllImport("kernel32.dll")]
+    static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
+
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr handle);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    static extern bool QueryFullProcessImageNameW(IntPtr process, uint flags, StringBuilder buffer, ref uint size);
+
+    static readonly Dictionary<uint, string> processNames = new Dictionary<uint, string>();
+    static DateTime processNamesPurgeAt = DateTime.MinValue;
+
+    // Same result as (Get-Process -Id $pid).ProcessName, but Get-Process snapshots every process
+    // on the machine per call - this was the bulk of each rescan's cost.
+    public static string GetProcessName(IntPtr hWnd)
+    {
+        uint pid;
+        GetWindowThreadProcessId(hWnd, out pid);
+        if (pid == 0) return null;
+        // PIDs get reused, so the cache can't live forever.
+        if (DateTime.UtcNow > processNamesPurgeAt)
+        {
+            processNames.Clear();
+            processNamesPurgeAt = DateTime.UtcNow.AddMinutes(2);
+        }
+        string name;
+        if (processNames.TryGetValue(pid, out name)) return name;
+        name = null;
+        IntPtr h = OpenProcess(0x1000, false, pid); // PROCESS_QUERY_LIMITED_INFORMATION
+        if (h != IntPtr.Zero)
+        {
+            try
+            {
+                var sb = new StringBuilder(1024);
+                uint size = (uint)sb.Capacity;
+                if (QueryFullProcessImageNameW(h, 0, sb, ref size))
+                    name = System.IO.Path.GetFileNameWithoutExtension(sb.ToString());
+            }
+            finally { CloseHandle(h); }
+        }
+        if (name == null)
+        {
+            // Protected processes refuse OpenProcess when not elevated.
+            try { name = System.Diagnostics.Process.GetProcessById((int)pid).ProcessName; } catch { }
+        }
+        processNames[pid] = name;
+        return name;
+    }
+
     public delegate void WinEventDelegate(IntPtr hWinEventHook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime);
 
     // WINEVENT_OUTOFCONTEXT (dwFlags=0) delivers callbacks synchronously on the calling
@@ -555,10 +633,7 @@ $script:PowerMenuDismissTimer = $null
 # ---------------------------------------------------------------------------
 
 function Test-ManageableWindow {
-    # $ProcCache is an optional pid -> process-name lookup reused across every window checked
-    # within a single Update-WindowSets pass, so multi-window apps (browsers, Explorer, etc.)
-    # only cost one Get-Process call per poll instead of one per window.
-    param([IntPtr]$Hwnd, [hashtable]$ProcCache)
+    param([IntPtr]$Hwnd)
 
     if ($Hwnd -eq $script:HotKeyWindowHandle) { return $false }
     if ($script:FloatingWindows.Contains($Hwnd)) { return $false }
@@ -579,18 +654,7 @@ function Test-ManageableWindow {
     $className = [Win32]::GetClass($Hwnd)
     if ($script:Config.ExcludedClasses -contains $className) { return $false }
 
-    $procId = 0
-    [Win32]::GetWindowThreadProcessId($Hwnd, [ref]$procId) | Out-Null
-    if ($ProcCache -and $ProcCache.ContainsKey($procId)) {
-        $procName = $ProcCache[$procId]
-    } else {
-        try {
-            $procName = (Get-Process -Id $procId -ErrorAction Stop).ProcessName
-        } catch {
-            $procName = $null
-        }
-        if ($ProcCache) { $ProcCache[$procId] = $procName }
-    }
+    $procName = [Win32]::GetProcessName($Hwnd)
     if ($procName -and ($script:Config.ExcludedProcesses -contains $procName)) { return $false }
 
     return $true
@@ -606,7 +670,7 @@ function Test-AlwaysVisibleWindow {
     # transient always-on-top alert, so it's treated as "never hide this for a workspace
     # switch" by default; AlwaysVisibleProcesses/AlwaysVisibleClasses cover anything that
     # doesn't set it.
-    param([IntPtr]$Hwnd, [hashtable]$ProcCache)
+    param([IntPtr]$Hwnd)
 
     $exStyle = [Win32]::GetWindowLong($Hwnd, -20) # GWL_EXSTYLE
     if (($exStyle -band 0x00000008) -ne 0) { return $true } # WS_EX_TOPMOST
@@ -615,14 +679,7 @@ function Test-AlwaysVisibleWindow {
         if ($script:Config.AlwaysVisibleClasses -contains [Win32]::GetClass($Hwnd)) { return $true }
     }
     if ($script:Config.AlwaysVisibleProcesses -and $script:Config.AlwaysVisibleProcesses.Count -gt 0) {
-        $procId = 0
-        [Win32]::GetWindowThreadProcessId($Hwnd, [ref]$procId) | Out-Null
-        if ($ProcCache -and $ProcCache.ContainsKey($procId)) {
-            $procName = $ProcCache[$procId]
-        } else {
-            try { $procName = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch { $procName = $null }
-            if ($ProcCache) { $ProcCache[$procId] = $procName }
-        }
+        $procName = [Win32]::GetProcessName($Hwnd)
         if ($procName -and ($script:Config.AlwaysVisibleProcesses -contains $procName)) { return $true }
     }
     return $false
@@ -644,9 +701,8 @@ function Get-ScreenSignature {
 
 function Get-WindowDescription {
     param([IntPtr]$Hwnd)
-    $procId = 0
-    [Win32]::GetWindowThreadProcessId($Hwnd, [ref]$procId) | Out-Null
-    try { $procName = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch { $procName = '?' }
+    $procName = [Win32]::GetProcessName($Hwnd)
+    if (-not $procName) { $procName = '?' }
     "hwnd=$Hwnd proc=$procName class=$([Win32]::GetClass($Hwnd)) title='$([Win32]::GetTitle($Hwnd))' rect=$([Win32]::GetRectString($Hwnd))"
 }
 
@@ -712,11 +768,17 @@ function Set-TiledWindowPos {
         Write-Log "Refusing degenerate tile for $Role - computed ${Width}x${Height} at $X,$Y. $(Get-WindowDescription -Hwnd $Hwnd)"
         return
     }
-    $before = [Win32]::GetRectString($Hwnd)
+    $r = New-Object 'Win32+RECT'
+    $hadRect = [Win32]::GetWindowRect($Hwnd, [ref]$r)
+    $before = "$($r.Left),$($r.Top) $($r.Right - $r.Left)x$($r.Bottom - $r.Top)"
+    $zoomed = [Win32]::IsZoomed($Hwnd)
+    # Most windows in a forced relayout are already in place; re-sending the same position
+    # still costs a cross-process message and a repaint in the target app.
+    if ($hadRect -and -not $zoomed -and $r.Left -eq $X -and $r.Top -eq $Y -and ($r.Right - $r.Left) -eq $Width -and ($r.Bottom - $r.Top) -eq $Height) { return }
     # A maximized window ignores SetWindowPos sizing and stays full-screen (Edge reopens
     # maximized, for example), so restore it first - without activating it.
-    if ([Win32]::IsZoomed($Hwnd)) {
-        Write-Log "Restoring maximized window before tiling ($Role). $(Get-WindowDescription -Hwnd $Hwnd)" -Level Debug
+    if ($zoomed) {
+        if ($script:LogDebugEnabled) { Write-Log "Restoring maximized window before tiling ($Role). $(Get-WindowDescription -Hwnd $Hwnd)" -Level Debug }
         [Win32]::ShowWindow($Hwnd, 4) | Out-Null # SW_SHOWNOACTIVATE
     }
     $err = [Win32]::SetWindowPosEx($Hwnd, $X, $Y, $Width, $Height, $Flags)
@@ -724,7 +786,6 @@ function Set-TiledWindowPos {
         Write-Log "SetWindowPos failed (win32 error $err) for $Role -> $X,$Y ${Width}x${Height}. $(Get-WindowDescription -Hwnd $Hwnd)"
         return
     }
-    $r = New-Object 'Win32+RECT'
     if (-not [Win32]::GetWindowRect($Hwnd, [ref]$r)) { return }
     $actualW = $r.Right - $r.Left
     $actualH = $r.Bottom - $r.Top
@@ -733,7 +794,7 @@ function Set-TiledWindowPos {
     if ([Math]::Abs($actualW - $Width) -gt $tolerance -or [Math]::Abs($actualH - $Height) -gt $tolerance -or
         [Math]::Abs($r.Left - $X) -gt $tolerance -or [Math]::Abs($r.Top - $Y) -gt $tolerance) {
         Write-Log "Window did not accept its tile ($Role): asked $X,$Y ${Width}x${Height}, got $($r.Left),$($r.Top) ${actualW}x${actualH} (was $before, maximized=$([Win32]::IsZoomed($Hwnd)), minimized=$([Win32]::IsIconic($Hwnd))). $(Get-WindowDescription -Hwnd $Hwnd)"
-    } else {
+    } elseif ($script:LogDebugEnabled) {
         Write-Log "tile $Role -> $X,$Y ${Width}x${Height} $(Get-WindowDescription -Hwnd $Hwnd)" -Level Debug
     }
 }
@@ -744,7 +805,10 @@ function Set-MonitorLayout {
     $list = $script:ManagedWindows[$MonitorKey]
     if (-not $list -or $list.Count -eq 0) { return }
 
-    $screen = [System.Windows.Forms.Screen]::AllScreens | Where-Object { $_.DeviceName -eq $MonitorKey } | Select-Object -First 1
+    $screen = $null
+    foreach ($s in [System.Windows.Forms.Screen]::AllScreens) {
+        if ($s.DeviceName -eq $MonitorKey) { $screen = $s; break }
+    }
     if (-not $screen) {
         # Windows enumerated this monitor when the windows were assigned to it, and doesn't now -
         # every window tracked here is about to be left un-tiled wherever it happens to sit.
@@ -774,7 +838,7 @@ function Set-MonitorLayout {
     $ratioKey = "$($script:ActiveWorkspace)|$MonitorKey"
     $ratio = if ($script:WorkspaceMasterRatio.ContainsKey($ratioKey)) { [double]$script:WorkspaceMasterRatio[$ratioKey] } else { [double]$script:Config.MasterRatio }
     $flags = 0x0004 -bor 0x0010 # SWP_NOZORDER | SWP_NOACTIVATE
-    Write-Log "layout '$MonitorKey': $($list.Count) window(s), area $($wa.X),$($wa.Y) $($wa.Width)x$($wa.Height), gap=$g, ratio=$ratio (key '$ratioKey'), workspace=$($script:ActiveWorkspace)" -Level Debug
+    if ($script:LogDebugEnabled) { Write-Log "layout '$MonitorKey': $($list.Count) window(s), area $($wa.X),$($wa.Y) $($wa.Width)x$($wa.Height), gap=$g, ratio=$ratio (key '$ratioKey'), workspace=$($script:ActiveWorkspace)" -Level Debug }
 
     if ($list.Count -eq 1) {
         Set-TiledWindowPos -Hwnd $list[0] -Role 'only' -X ($wa.X + $g) -Y ($wa.Y + $g) -Width ($wa.Width - (2 * $g)) -Height ($wa.Height - (2 * $g)) -Flags $flags
@@ -812,10 +876,13 @@ function Update-WindowSets {
     }
 
     $allHwnds = [Win32]::GetTopLevelWindows()
+    # For the stale-entry purges below; -notcontains on the raw list was a linear scan per entry.
+    $allHwndSet = [System.Collections.Generic.HashSet[IntPtr]]::new($allHwnds)
+    $tracked = [System.Collections.Generic.HashSet[IntPtr]]::new($script:DismissedWindows)
+    foreach ($h in $script:WindowWorkspace.Keys) { [void]$tracked.Add($h) }
     $byMonitor = @{}
-    $procNameCache = @{} # pid -> process name, scoped to this single pass - see Test-ManageableWindow
 
-    foreach ($hwnd in $allHwnds) {
+    foreach ($hwnd in [Win32]::VisibleOrTracked($allHwnds, $tracked)) {
         if ($hwnd -eq $script:HotKeyWindowHandle) { continue }
         # Outlook (classic) sometimes leaves behind a blank/titleless top-level frame - its
         # rctrl_renwnd32 window class is reused by both the Explorer and Inspector windows - after
@@ -834,12 +901,11 @@ function Update-WindowSets {
         # to this workspace, making a dismissed reminder/compose window look like it "reopens
         # itself". Detect the visible -> hidden transition happening on its own (i.e. not because
         # *we* just hid it for an outgoing workspace) and stop showing that window for good.
-        $isOutlookSingleton = @('#32770', 'rctrl_renwnd32') -contains [Win32]::GetClass($hwnd)
-        if ($isOutlookSingleton -and $script:WindowWorkspace.ContainsKey($hwnd) -and $script:WindowWorkspace[$hwnd] -eq $script:ActiveWorkspace) {
-            $procId = 0
-            [Win32]::GetWindowThreadProcessId($hwnd, [ref]$procId) | Out-Null
-            $isOutlookProc = $false
-            try { $isOutlookProc = (Get-Process -Id $procId -ErrorAction Stop).ProcessName -eq 'OUTLOOK' } catch { }
+        # Hash lookup first - rules out nearly every window before the class-name call.
+        $isOutlookSingleton = $script:WindowWorkspace.ContainsKey($hwnd) -and $script:WindowWorkspace[$hwnd] -eq $script:ActiveWorkspace -and
+            (@('#32770', 'rctrl_renwnd32') -contains [Win32]::GetClass($hwnd))
+        if ($isOutlookSingleton) {
+            $isOutlookProc = [Win32]::GetProcessName($hwnd) -eq 'OUTLOOK'
             $visibleNow = [Win32]::IsWindowVisible($hwnd)
             if ($isOutlookProc -and $script:LastWindowVisible.ContainsKey($hwnd) -and $script:LastWindowVisible[$hwnd] -and -not $visibleNow) {
                 [void]$script:DismissedWindows.Add($hwnd)
@@ -862,11 +928,11 @@ function Update-WindowSets {
         # a different workspace is active is exactly the "incoming call" case that should
         # stay on screen rather than get silently hidden again.
         if ($script:WindowWorkspace.ContainsKey($hwnd) -and $script:WindowWorkspace[$hwnd] -ne $script:ActiveWorkspace) {
-            if (Test-AlwaysVisibleWindow -Hwnd $hwnd -ProcCache $procNameCache) { continue }
+            if (Test-AlwaysVisibleWindow -Hwnd $hwnd) { continue }
             if ([Win32]::IsWindowVisible($hwnd)) { [Win32]::ShowWindow($hwnd, 0) | Out-Null } # SW_HIDE
             continue
         }
-        if (-not (Test-ManageableWindow -Hwnd $hwnd -ProcCache $procNameCache)) { continue }
+        if (-not (Test-ManageableWindow -Hwnd $hwnd)) { continue }
         $screen = [System.Windows.Forms.Screen]::FromHandle($hwnd)
         $key = $screen.DeviceName
         if (-not $byMonitor.ContainsKey($key)) { $byMonitor[$key] = New-Object 'System.Collections.Generic.List[IntPtr]' }
@@ -874,16 +940,16 @@ function Update-WindowSets {
     }
 
     foreach ($hwnd in @($script:WindowWorkspace.Keys)) {
-        if ($allHwnds -notcontains $hwnd) { $script:WindowWorkspace.Remove($hwnd) }
+        if (-not $allHwndSet.Contains($hwnd)) { $script:WindowWorkspace.Remove($hwnd) }
     }
     # Purge bookkeeping for any hwnd that's been fully destroyed, not just hidden, so a genuinely
     # new window (a fresh Outlook reminder/compose instance reusing a recycled-looking title) isn't
     # mistaken for one already marked dismissed, and these dictionaries don't grow unbounded.
     foreach ($hwnd in @($script:LastWindowVisible.Keys)) {
-        if ($allHwnds -notcontains $hwnd) { $script:LastWindowVisible.Remove($hwnd) }
+        if (-not $allHwndSet.Contains($hwnd)) { $script:LastWindowVisible.Remove($hwnd) }
     }
     foreach ($hwnd in @($script:DismissedWindows)) {
-        if ($allHwnds -notcontains $hwnd) { [void]$script:DismissedWindows.Remove($hwnd) }
+        if (-not $allHwndSet.Contains($hwnd)) { [void]$script:DismissedWindows.Remove($hwnd) }
     }
 
     $changed = $Force.IsPresent
@@ -1109,7 +1175,8 @@ function Invoke-Restart {
     Write-Log "Restarting..." -Level Info
     try {
         $exePath = (Get-Process -Id $PID).Path
-        Start-Process -FilePath $exePath -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+        # -NoProfile: a managed-machine profile can add seconds to every restart.
+        Start-Process -FilePath $exePath -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
     } catch {
         Write-Log "Failed to relaunch for restart: $_"
         return
@@ -1456,9 +1523,7 @@ function Update-StatusBarContent {
     foreach ($hwnd in @($script:WindowWorkspace.Keys)) {
         $className = [Win32]::GetClass($hwnd)
         if ($script:Config.ExcludedClasses -contains $className) { continue }
-        $procId = 0
-        [Win32]::GetWindowThreadProcessId($hwnd, [ref]$procId) | Out-Null
-        try { $procName = (Get-Process -Id $procId -ErrorAction Stop).ProcessName } catch { $procName = $null }
+        $procName = [Win32]::GetProcessName($hwnd)
         if (-not $procName -or ($script:Config.ExcludedProcesses -contains $procName)) { continue }
 
         $ws = $script:WindowWorkspace[$hwnd]
@@ -1757,4 +1822,5 @@ try {
     if (-not $hotkeyWindow.IsDisposed) { $hotkeyWindow.Dispose() }
     try { $script:InstanceMutex.ReleaseMutex() } catch { }
     $script:InstanceMutex.Dispose()
+    Close-LogWriter
 }
