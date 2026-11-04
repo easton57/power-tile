@@ -12,7 +12,7 @@ Power tile is a PowerShell tiling window manager for those poor souls stuck on a
 * A fuzzy application launcher because the Start menu, after all these years, is still hot garbage
 * Configurable quick-launch shortcuts
 * A persistent top bar showing occupied workspaces and their open applications; empty workspaces are hidden
-* Clock and battery widgets styled consistently with occupied workspaces
+* Clock, battery, and wifi widgets styled consistently with occupied workspaces
 * A top-left power menu with Lock, Sleep, Restart, Shut down, and Exit actions
 * Optional Windows taskbar hiding, restored automatically when power-tile exits
 * Configurable status-bar colors and alignment

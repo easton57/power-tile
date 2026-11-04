@@ -142,6 +142,10 @@ $script:DefaultConfig = @{
     # Battery percentage next to the clock - shown whenever a battery is detected,
     # regardless of HideTaskbar (desktops without a battery never show it).
     StatusBarShowBattery = $true
+    # Wifi icon + signal % left of the battery - hidden automatically without a wifi adapter.
+    StatusBarShowWifi     = $true
+    StatusBarShowWifiSsid = $false
+    StatusBarWifiPollMs   = 5000
     # 'Left', 'Center', or 'Right' placement of the workspace slots within the bar
     StatusBarAlignment     = 'Left'
     # accepts '#RRGGBB' hex or named colors (e.g. 'DodgerBlue')
@@ -480,6 +484,140 @@ public class Win32
     public static extern bool UnhookWinEvent(IntPtr hWinEventHook);
 }
 
+public class WifiInfo
+{
+    public bool HasAdapter;
+    public bool Connected;
+    public int SignalQuality; // 0-100, as Windows reports it
+    public string Ssid = "";
+}
+
+// Native WLAN API rather than `netsh wlan show interfaces`, which would spawn a process per poll.
+public static class WifiStatus
+{
+    [DllImport("wlanapi.dll")] static extern uint WlanOpenHandle(uint clientVersion, IntPtr reserved, out uint negotiatedVersion, out IntPtr clientHandle);
+    [DllImport("wlanapi.dll")] static extern uint WlanCloseHandle(IntPtr clientHandle, IntPtr reserved);
+    [DllImport("wlanapi.dll")] static extern uint WlanEnumInterfaces(IntPtr clientHandle, IntPtr reserved, out IntPtr interfaceList);
+    [DllImport("wlanapi.dll")] static extern uint WlanQueryInterface(IntPtr clientHandle, ref Guid interfaceGuid, uint opCode, IntPtr reserved, out uint dataSize, out IntPtr data, IntPtr opCodeValueType);
+    [DllImport("wlanapi.dll")] static extern void WlanFreeMemory(IntPtr memory);
+
+    const uint OPCODE_CURRENT_CONNECTION = 7;
+    const uint INTERFACE_STATE_CONNECTED = 1;
+    const int LIST_HEADER_SIZE = 8;        // WLAN_INTERFACE_INFO_LIST: dwNumberOfItems, dwIndex
+    const int INTERFACE_ENTRY_SIZE = 532;  // WLAN_INTERFACE_INFO: GUID + WCHAR[256] + state
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct DOT11_SSID
+    {
+        public uint uSSIDLength;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)] public byte[] ucSSID;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct WLAN_ASSOCIATION_ATTRIBUTES
+    {
+        public DOT11_SSID dot11Ssid;
+        public uint dot11BssType;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 6)] public byte[] dot11Bssid;
+        public uint dot11PhyType;
+        public uint uDot11PhyIndex;
+        public uint wlanSignalQuality;
+        public uint ulRxRate;
+        public uint ulTxRate;
+    }
+
+    // Trailing security attributes are intentionally omitted; PtrToStructure only reads these.
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct WLAN_CONNECTION_ATTRIBUTES
+    {
+        public uint isState;
+        public uint wlanConnectionMode;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string strProfileName;
+        public WLAN_ASSOCIATION_ATTRIBUTES association;
+    }
+
+    static IntPtr clientHandle = IntPtr.Zero;
+    static DateTime retryAfter = DateTime.MinValue;
+
+    public static WifiInfo Query()
+    {
+        // wlanapi.dll doesn't exist at all on machines without the WLAN feature.
+        try { return QueryCore(); }
+        catch { Close(); retryAfter = DateTime.UtcNow.AddMinutes(5); return new WifiInfo(); }
+    }
+
+    public static void Close()
+    {
+        if (clientHandle == IntPtr.Zero) return;
+        try { WlanCloseHandle(clientHandle, IntPtr.Zero); } catch { }
+        clientHandle = IntPtr.Zero;
+    }
+
+    static WifiInfo QueryCore()
+    {
+        var info = new WifiInfo();
+        if (!EnsureHandle()) return info;
+
+        IntPtr list;
+        if (WlanEnumInterfaces(clientHandle, IntPtr.Zero, out list) != 0 || list == IntPtr.Zero)
+        {
+            // Usually the WLAN service restarted under us - reopen on a later poll.
+            Close();
+            retryAfter = DateTime.UtcNow.AddSeconds(30);
+            return info;
+        }
+        try
+        {
+            int count = Marshal.ReadInt32(list, 0);
+            if (count <= 0) return info;
+            info.HasAdapter = true;
+            for (int i = 0; i < count; i++)
+            {
+                IntPtr entry = (IntPtr)(list.ToInt64() + LIST_HEADER_SIZE + (i * INTERFACE_ENTRY_SIZE));
+                uint state = (uint)Marshal.ReadInt32(entry, 16 + 512);
+                if (state != INTERFACE_STATE_CONNECTED) continue;
+                var guid = (Guid)Marshal.PtrToStructure(entry, typeof(Guid));
+                if (FillConnection(guid, info)) break;
+            }
+        }
+        finally { WlanFreeMemory(list); }
+        return info;
+    }
+
+    static bool FillConnection(Guid interfaceGuid, WifiInfo info)
+    {
+        IntPtr data;
+        uint size;
+        if (WlanQueryInterface(clientHandle, ref interfaceGuid, OPCODE_CURRENT_CONNECTION, IntPtr.Zero, out size, out data, IntPtr.Zero) != 0 || data == IntPtr.Zero) return false;
+        try
+        {
+            var attrs = (WLAN_CONNECTION_ATTRIBUTES)Marshal.PtrToStructure(data, typeof(WLAN_CONNECTION_ATTRIBUTES));
+            info.Connected = true;
+            info.SignalQuality = (int)attrs.association.wlanSignalQuality;
+            int len = (int)attrs.association.dot11Ssid.uSSIDLength;
+            if (len > 0 && len <= 32) info.Ssid = Encoding.UTF8.GetString(attrs.association.dot11Ssid.ucSSID, 0, len);
+            return true;
+        }
+        finally { WlanFreeMemory(data); }
+    }
+
+    static bool EnsureHandle()
+    {
+        if (clientHandle != IntPtr.Zero) return true;
+        if (DateTime.UtcNow < retryAfter) return false;
+        uint negotiated;
+        IntPtr handle;
+        if (WlanOpenHandle(2, IntPtr.Zero, out negotiated, out handle) != 0 || handle == IntPtr.Zero)
+        {
+            // WLAN service missing or disabled (e.g. a wired-only desktop).
+            retryAfter = DateTime.UtcNow.AddMinutes(1);
+            return false;
+        }
+        clientHandle = handle;
+        return true;
+    }
+}
+
 // Hidden message-only-style window used purely to receive WM_HOTKEY messages
 // and to pump the message loop the whole tiling manager runs on.
 public class HotKeyWindow : Form
@@ -623,6 +761,10 @@ $script:StatusBarColors = @{}   # parsed Color objects, populated by Initialize-
 $script:StatusBarFlow = $null   # FlowLayoutPanel holding the workspace labels, repositioned for alignment
 $script:StatusBarClockLabel = $null   # top-of-screen clock label (only when HideTaskbar + StatusBarShowClock)
 $script:StatusBarBatteryLabel = $null # top-of-screen battery % label (only when a battery is present)
+$script:StatusBarWifiLabel = $null    # wifi signal % label
+$script:StatusBarWifiIcon = $null     # wifi icon label, drawn just left of the % label
+$script:WifiWidgetShown = $false
+$script:NextWifiPoll = [datetime]::MinValue
 $script:PowerMenuForm = $null   # separate interactive form for the top-left power button
 $script:PowerMenu = $null
 $script:PowerMenuButton = $null
@@ -1445,8 +1587,36 @@ function Initialize-StatusBar {
         $script:StatusBarBatteryLabel = $battery
     }
 
+    $script:StatusBarWifiLabel = $null
+    $script:StatusBarWifiIcon = $null
+    if ($script:Config.StatusBarShowWifi) {
+        $wifi = New-Object System.Windows.Forms.Label
+        $wifi.AutoSize = $true
+        $wifi.Padding = [System.Windows.Forms.Padding]::new(2, 4, 8, 4)
+        $wifi.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 9
+        $wifi.ForeColor = $script:StatusBarColors.Text
+        $wifi.BackColor = $script:StatusBarColors.Busy
+        $wifi.Visible = $false
+        $form.Controls.Add($wifi)
+        $script:StatusBarWifiLabel = $wifi
+
+        # Separate label because the icon needs the icon font; height follows the text label.
+        $icon = New-Object System.Windows.Forms.Label
+        $icon.AutoSize = $false
+        $icon.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe MDL2 Assets', 10
+        $icon.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+        $icon.ForeColor = $script:StatusBarColors.Text
+        $icon.BackColor = $script:StatusBarColors.Busy
+        $icon.Text = [string][char]0xE701
+        $icon.Width = [System.Windows.Forms.TextRenderer]::MeasureText($icon.Text, $icon.Font).Width + 4
+        $icon.Visible = $false
+        $form.Controls.Add($icon)
+        $script:StatusBarWifiIcon = $icon
+    }
+
     Update-StatusBarClock
     Update-StatusBarBattery
+    Update-StatusBarWifi
     Update-StatusBarRightWidgets
     Initialize-PowerMenu -Screen $screen -Height $height
 
@@ -1480,19 +1650,61 @@ function Update-StatusBarBattery {
     }
 }
 
+function Update-StatusBarWifi {
+    $label = $script:StatusBarWifiLabel
+    $icon = $script:StatusBarWifiIcon
+    if (-not $label -or $label.IsDisposed) { return }
+    $now = [datetime]::UtcNow
+    if ($now -lt $script:NextWifiPoll) { return }
+    $script:NextWifiPoll = $now.AddMilliseconds([int]$script:Config.StatusBarWifiPollMs)
+
+    $info = [WifiStatus]::Query()
+    if (-not $info.HasAdapter) {
+        $script:WifiWidgetShown = $false
+        $label.Visible = $false
+        $icon.Visible = $false
+        return
+    }
+
+    if ($info.Connected) {
+        $quality = [Math]::Max(0, [Math]::Min(100, [int]$info.SignalQuality))
+        # Segoe MDL2 Assets wifi fan with 1-4 arcs lit.
+        $glyph = if ($quality -gt 75) { 0xE701 } elseif ($quality -gt 50) { 0xE874 } elseif ($quality -gt 25) { 0xE873 } else { 0xE872 }
+        $text = "$quality%"
+        if ($script:Config.StatusBarShowWifiSsid -and $info.Ssid) { $text = "$text $($info.Ssid)" }
+        $color = $script:StatusBarColors.Text
+    } else {
+        $glyph = 0xEB5E # wifi fan with an X
+        $text = 'off'
+        $color = $script:StatusBarColors.IdleText
+    }
+    $label.Text = $text
+    $label.ForeColor = $color
+    $icon.Text = [string][char]$glyph
+    $icon.ForeColor = $color
+    $icon.Height = $label.Height
+    $label.Visible = $true
+    $icon.Visible = $true
+    $script:WifiWidgetShown = $true
+}
+
 function Update-StatusBarRightWidgets {
-    # Lays the clock and battery labels out from the right edge of the bar, in that
-    # order - both float directly on the form (not the flow panel) so they stay flush
+    # Lays the clock, battery and wifi labels out from the right edge of the bar, in that
+    # order - all float directly on the form (not the flow panel) so they stay flush
     # right regardless of the workspace slots' own alignment setting.
     $form = $script:StatusBarForm
     if (-not $form -or $form.IsDisposed) { return }
     $x = $form.ClientSize.Width - 12
-    foreach ($label in @($script:StatusBarClockLabel, $script:StatusBarBatteryLabel)) {
+    foreach ($label in @($script:StatusBarClockLabel, $script:StatusBarBatteryLabel, $script:StatusBarWifiLabel, $script:StatusBarWifiIcon)) {
         if (-not $label -or $label.IsDisposed) { continue }
+        # A flag, not $label.Visible - that reads $false for every child until the form is shown.
+        $isWifi = $label -eq $script:StatusBarWifiLabel -or $label -eq $script:StatusBarWifiIcon
+        if ($isWifi -and -not $script:WifiWidgetShown) { continue }
         $x -= $label.Width
         $y = [int](($form.ClientSize.Height - $label.Height) / 2)
         $label.Location = [System.Drawing.Point]::new([Math]::Max(0, $x), [Math]::Max(0, $y))
-        $x -= 12
+        # No gap between the wifi percentage and its icon.
+        if ($label -ne $script:StatusBarWifiLabel) { $x -= 12 }
     }
 }
 
@@ -1744,7 +1956,7 @@ $timer.Interval = [int]$script:Config.PollIntervalMs
 # loop and silently kill the whole app - keep the WM alive and log it instead.
 $timer.add_Tick({
     try {
-        Update-WindowSets; Update-StatusBarContent; Update-StatusBarClock; Update-StatusBarBattery; Update-StatusBarRightWidgets
+        Update-WindowSets; Update-StatusBarContent; Update-StatusBarClock; Update-StatusBarBattery; Update-StatusBarWifi; Update-StatusBarRightWidgets
     } catch { Write-Log "Update-WindowSets failed: $_" }
 })
 
@@ -1820,6 +2032,7 @@ try {
     if ($script:PowerMenuForm -and -not $script:PowerMenuForm.IsDisposed) { $script:PowerMenuForm.Dispose() }
     Stop-AppLauncher
     if (-not $hotkeyWindow.IsDisposed) { $hotkeyWindow.Dispose() }
+    try { [WifiStatus]::Close() } catch { }
     try { $script:InstanceMutex.ReleaseMutex() } catch { }
     $script:InstanceMutex.Dispose()
     Close-LogWriter

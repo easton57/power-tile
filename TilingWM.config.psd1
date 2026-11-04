@@ -22,6 +22,9 @@
     HideTaskbar        = $true   # hide the real Windows taskbar too (restored automatically on exit)
     StatusBarShowClock = $true   # show a clock/date on the status bar - only matters when HideTaskbar is $true
     StatusBarShowBattery = $true # show battery % next to the clock - only if a battery is detected
+    StatusBarShowWifi     = $true  # wifi icon + signal % - hidden if there's no wifi adapter
+    StatusBarShowWifiSsid = $false # also show the network name
+    StatusBarWifiPollMs   = 5000   # how often (ms) to re-read the wifi signal
 
     # colors accept '#RRGGBB' hex or named colors (e.g. 'DodgerBlue')
     # Occupied workspace slots and status widgets are opaque; the rest is transparent.
