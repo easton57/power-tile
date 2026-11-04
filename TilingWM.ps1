@@ -1530,9 +1530,10 @@ function ConvertTo-BarColor {
 function Initialize-PowerMenu {
     param([System.Windows.Forms.Screen]$Screen, [int]$Height)
 
-    $buttonSize = $Height
+    # Same 2px top/bottom inset the bar's labels get, so they all line up.
+    $buttonSize = $Height - 4
     $buttonX = $Screen.Bounds.X
-    $buttonY = $Screen.Bounds.Y
+    $buttonY = $Screen.Bounds.Y + 2
 
     $form = New-Object System.Windows.Forms.Form
     $form.FormBorderStyle = 'None'
@@ -1622,7 +1623,16 @@ function Initialize-PowerMenu {
 
 function Initialize-StatusBar {
     $screen = [System.Windows.Forms.Screen]::PrimaryScreen
-    $height = [int]$script:Config.StatusBarHeight
+    # StatusBarHeight is physical pixels, so at high display scaling the labels outgrow it and
+    # get clipped. Grow it to fit; written back so tiling reserves the same space.
+    $probe = New-Object System.Windows.Forms.Label
+    $probe.AutoSize = $true
+    $probe.Padding = [System.Windows.Forms.Padding]::new(8, 4, 8, 4)
+    $probe.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 9
+    $probe.Text = '0'
+    $height = [Math]::Max([int]$script:Config.StatusBarHeight, $probe.PreferredHeight + 4)
+    $probe.Dispose()
+    $script:Config.StatusBarHeight = $height
 
     $script:StatusBarColors = @{
         Background = ConvertTo-BarColor $script:Config.StatusBarBackColor ([System.Drawing.Color]::FromArgb(24, 24, 24))
