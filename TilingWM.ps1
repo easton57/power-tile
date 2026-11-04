@@ -763,6 +763,7 @@ $script:StatusBarClockLabel = $null   # top-of-screen clock label (only when Hid
 $script:StatusBarBatteryLabel = $null # top-of-screen battery % label (only when a battery is present)
 $script:StatusBarWifiLabel = $null    # wifi signal % label
 $script:StatusBarWifiIcon = $null     # wifi icon label, drawn just left of the % label
+$script:WifiForm = $null              # clickable host for the wifi labels (opens Wi-Fi settings)
 $script:WifiWidgetShown = $false
 $script:NextWifiPoll = [datetime]::MinValue
 $script:PowerMenuForm = $null   # separate interactive form for the top-left power button
@@ -1589,15 +1590,24 @@ function Initialize-StatusBar {
 
     $script:StatusBarWifiLabel = $null
     $script:StatusBarWifiIcon = $null
+    $script:WifiForm = $null
     if ($script:Config.StatusBarShowWifi) {
+        # Own form because the bar itself is click-through (WS_EX_TRANSPARENT), like the power button.
+        $wifiForm = New-Object System.Windows.Forms.Form
+        $wifiForm.FormBorderStyle = 'None'
+        $wifiForm.StartPosition = 'Manual'
+        $wifiForm.ShowInTaskbar = $false
+        $wifiForm.TopMost = $true
+        $wifiForm.BackColor = $script:StatusBarColors.Busy
+        $wifiForm.Cursor = [System.Windows.Forms.Cursors]::Hand
+
         $wifi = New-Object System.Windows.Forms.Label
         $wifi.AutoSize = $true
         $wifi.Padding = [System.Windows.Forms.Padding]::new(2, 4, 8, 4)
         $wifi.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 9
         $wifi.ForeColor = $script:StatusBarColors.Text
         $wifi.BackColor = $script:StatusBarColors.Busy
-        $wifi.Visible = $false
-        $form.Controls.Add($wifi)
+        $wifiForm.Controls.Add($wifi)
         $script:StatusBarWifiLabel = $wifi
 
         # Separate label because the icon needs the icon font; height follows the text label.
@@ -1609,18 +1619,30 @@ function Initialize-StatusBar {
         $icon.BackColor = $script:StatusBarColors.Busy
         $icon.Text = [string][char]0xE701
         $icon.Width = [System.Windows.Forms.TextRenderer]::MeasureText($icon.Text, $icon.Font).Width + 4
-        $icon.Visible = $false
-        $form.Controls.Add($icon)
+        $wifiForm.Controls.Add($icon)
         $script:StatusBarWifiIcon = $icon
+
+        $openWifiSettings = {
+            try { Start-Process 'ms-settings:network-wifi' } catch { Write-Log "Opening wifi settings failed: $_" }
+        }
+        $wifiForm.add_Click($openWifiSettings)
+        $wifi.add_Click($openWifiSettings)
+        $icon.add_Click($openWifiSettings)
+
+        [void]$wifiForm.Handle
+        $exStyle = [Win32]::GetWindowLong($wifiForm.Handle, -20)
+        $exStyle = $exStyle -bor 0x08000000 -bor 0x00000080 # WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+        [Win32]::SetWindowLong($wifiForm.Handle, -20, $exStyle) | Out-Null
+        $script:WifiForm = $wifiForm
     }
 
     Update-StatusBarClock
     Update-StatusBarBattery
-    Update-StatusBarWifi
-    Update-StatusBarRightWidgets
     Initialize-PowerMenu -Screen $screen -Height $height
 
     $form.Show()
+    Update-StatusBarWifi
+    Update-StatusBarRightWidgets
 }
 
 function Test-HasBattery {
@@ -1661,8 +1683,7 @@ function Update-StatusBarWifi {
     $info = [WifiStatus]::Query()
     if (-not $info.HasAdapter) {
         $script:WifiWidgetShown = $false
-        $label.Visible = $false
-        $icon.Visible = $false
+        if ($script:WifiForm.Visible) { $script:WifiForm.Hide() }
         return
     }
 
@@ -1683,8 +1704,6 @@ function Update-StatusBarWifi {
     $icon.Text = [string][char]$glyph
     $icon.ForeColor = $color
     $icon.Height = $label.Height
-    $label.Visible = $true
-    $icon.Visible = $true
     $script:WifiWidgetShown = $true
 }
 
@@ -1695,17 +1714,28 @@ function Update-StatusBarRightWidgets {
     $form = $script:StatusBarForm
     if (-not $form -or $form.IsDisposed) { return }
     $x = $form.ClientSize.Width - 12
-    foreach ($label in @($script:StatusBarClockLabel, $script:StatusBarBatteryLabel, $script:StatusBarWifiLabel, $script:StatusBarWifiIcon)) {
+    foreach ($label in @($script:StatusBarClockLabel, $script:StatusBarBatteryLabel)) {
         if (-not $label -or $label.IsDisposed) { continue }
-        # A flag, not $label.Visible - that reads $false for every child until the form is shown.
-        $isWifi = $label -eq $script:StatusBarWifiLabel -or $label -eq $script:StatusBarWifiIcon
-        if ($isWifi -and -not $script:WifiWidgetShown) { continue }
         $x -= $label.Width
         $y = [int](($form.ClientSize.Height - $label.Height) / 2)
         $label.Location = [System.Drawing.Point]::new([Math]::Max(0, $x), [Math]::Max(0, $y))
-        # No gap between the wifi percentage and its icon.
-        if ($label -ne $script:StatusBarWifiLabel) { $x -= 12 }
+        $x -= 12
     }
+
+    $wifiForm = $script:WifiForm
+    if (-not $wifiForm -or $wifiForm.IsDisposed -or -not $script:WifiWidgetShown) { return }
+    $icon = $script:StatusBarWifiIcon
+    $label = $script:StatusBarWifiLabel
+    $width = $icon.Width + $label.Width
+    # Clipped to the bar's height, the same way the clock/battery labels are.
+    $height = [Math]::Min($label.Height, $form.ClientSize.Height)
+    $x -= $width
+    $y = [Math]::Max(0, [int](($form.ClientSize.Height - $label.Height) / 2))
+    $icon.Location = [System.Drawing.Point]::new(0, 0)
+    $label.Location = [System.Drawing.Point]::new($icon.Width, 0)
+    $bounds = [System.Drawing.Rectangle]::new($form.Left + [Math]::Max(0, $x), $form.Top + $y, $width, $height)
+    if ($wifiForm.Bounds -ne $bounds) { $wifiForm.Bounds = $bounds }
+    if (-not $wifiForm.Visible) { $wifiForm.Show() }
 }
 
 function Update-StatusBarAlignment {
@@ -2030,6 +2060,7 @@ try {
     if ($script:PowerMenuDismissTimer) { $script:PowerMenuDismissTimer.Stop(); $script:PowerMenuDismissTimer.Dispose() }
     if ($script:PowerMenu -and -not $script:PowerMenu.IsDisposed) { $script:PowerMenu.Dispose() }
     if ($script:PowerMenuForm -and -not $script:PowerMenuForm.IsDisposed) { $script:PowerMenuForm.Dispose() }
+    if ($script:WifiForm -and -not $script:WifiForm.IsDisposed) { $script:WifiForm.Dispose() }
     Stop-AppLauncher
     if (-not $hotkeyWindow.IsDisposed) { $hotkeyWindow.Dispose() }
     try { [WifiStatus]::Close() } catch { }
