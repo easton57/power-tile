@@ -25,6 +25,7 @@
     StatusBarShowWifi     = $true  # wifi icon + signal % - hidden if there's no wifi adapter
     StatusBarShowWifiSsid = $false # also show the network name
     StatusBarWifiPollMs   = 5000   # how often (ms) to re-read the wifi signal
+    StatusBarShowAudio    = $true  # speaker volume/mute and mic mute - click opens Sound settings
 
     # colors accept '#RRGGBB' hex or named colors (e.g. 'DodgerBlue')
     # Occupied workspace slots and status widgets are opaque; the rest is transparent.

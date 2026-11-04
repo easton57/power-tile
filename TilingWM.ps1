@@ -146,6 +146,8 @@ $script:DefaultConfig = @{
     StatusBarShowWifi     = $true
     StatusBarShowWifiSsid = $false
     StatusBarWifiPollMs   = 5000
+    # Speaker volume/mute and mic mute, left of the wifi widget.
+    StatusBarShowAudio    = $true
     # 'Left', 'Center', or 'Right' placement of the workspace slots within the bar
     StatusBarAlignment     = 'Left'
     # accepts '#RRGGBB' hex or named colors (e.g. 'DodgerBlue')
@@ -618,6 +620,128 @@ public static class WifiStatus
     }
 }
 
+public class AudioInfo
+{
+    public bool HasSpeaker;
+    public int SpeakerVolume; // 0-100
+    public bool SpeakerMuted;
+    public bool HasMic;
+    public bool MicMuted;
+}
+
+// Default playback/recording endpoints via Core Audio (same source as the Windows volume flyout).
+public static class AudioStatus
+{
+    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+    class MMDeviceEnumeratorCom { }
+
+    [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceEnumerator
+    {
+        [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IntPtr devices);
+        [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice device);
+    }
+
+    [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDevice
+    {
+        [PreserveSig] int Activate(ref Guid iid, int clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object endpoint);
+    }
+
+    [ComImport, Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioEndpointVolume
+    {
+        [PreserveSig] int RegisterControlChangeNotify(IntPtr notify);
+        [PreserveSig] int UnregisterControlChangeNotify(IntPtr notify);
+        [PreserveSig] int GetChannelCount(out uint count);
+        [PreserveSig] int SetMasterVolumeLevel(float levelDB, ref Guid context);
+        [PreserveSig] int SetMasterVolumeLevelScalar(float level, ref Guid context);
+        [PreserveSig] int GetMasterVolumeLevel(out float levelDB);
+        [PreserveSig] int GetMasterVolumeLevelScalar(out float level);
+        [PreserveSig] int SetChannelVolumeLevel(uint channel, float levelDB, ref Guid context);
+        [PreserveSig] int SetChannelVolumeLevelScalar(uint channel, float level, ref Guid context);
+        [PreserveSig] int GetChannelVolumeLevel(uint channel, out float levelDB);
+        [PreserveSig] int GetChannelVolumeLevelScalar(uint channel, out float level);
+        [PreserveSig] int SetMute([MarshalAs(UnmanagedType.Bool)] bool mute, ref Guid context);
+        [PreserveSig] int GetMute([MarshalAs(UnmanagedType.Bool)] out bool mute);
+    }
+
+    const int E_RENDER = 0, E_CAPTURE = 1, E_CONSOLE = 0;
+    const int CLSCTX_ALL = 23;
+    static IMMDeviceEnumerator enumerator;
+    static IAudioEndpointVolume speaker, mic;
+    // Resolving the default devices costs a few ms; reading a cached endpoint costs microseconds.
+    static DateTime refreshAt = DateTime.MinValue;
+
+    public static AudioInfo Query()
+    {
+        var info = new AudioInfo();
+        try
+        {
+            if (enumerator == null) enumerator = (IMMDeviceEnumerator)new MMDeviceEnumeratorCom();
+            if (DateTime.UtcNow >= refreshAt)
+            {
+                // Periodic so a newly plugged-in headset becomes the one we report.
+                ReleaseEndpoints();
+                speaker = OpenEndpoint(E_RENDER);
+                mic = OpenEndpoint(E_CAPTURE);
+                refreshAt = DateTime.UtcNow.AddSeconds(5);
+            }
+            float level;
+            bool muted;
+            if (speaker != null && speaker.GetMasterVolumeLevelScalar(out level) == 0)
+            {
+                speaker.GetMute(out muted);
+                info.HasSpeaker = true;
+                info.SpeakerVolume = (int)Math.Round(level * 100);
+                info.SpeakerMuted = muted;
+            }
+            if (mic != null && mic.GetMute(out muted) == 0)
+            {
+                info.HasMic = true;
+                info.MicMuted = muted;
+            }
+        }
+        catch
+        {
+            // A removed device or audio service restart invalidates these; rebuild next poll.
+            Close();
+        }
+        return info;
+    }
+
+    public static void Close()
+    {
+        ReleaseEndpoints();
+        if (enumerator != null) { try { Marshal.ReleaseComObject(enumerator); } catch { } }
+        enumerator = null;
+        refreshAt = DateTime.MinValue;
+    }
+
+    static void ReleaseEndpoints()
+    {
+        if (speaker != null) { try { Marshal.ReleaseComObject(speaker); } catch { } }
+        if (mic != null) { try { Marshal.ReleaseComObject(mic); } catch { } }
+        speaker = null;
+        mic = null;
+    }
+
+    static IAudioEndpointVolume OpenEndpoint(int dataFlow)
+    {
+        IMMDevice device;
+        // Fails with E_NOTFOUND when no device of this kind is present/enabled.
+        if (enumerator.GetDefaultAudioEndpoint(dataFlow, E_CONSOLE, out device) != 0 || device == null) return null;
+        try
+        {
+            Guid iid = typeof(IAudioEndpointVolume).GUID;
+            object endpoint;
+            if (device.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero, out endpoint) != 0) return null;
+            return endpoint as IAudioEndpointVolume;
+        }
+        finally { Marshal.ReleaseComObject(device); }
+    }
+}
+
 // Hidden message-only-style window used purely to receive WM_HOTKEY messages
 // and to pump the message loop the whole tiling manager runs on.
 public class HotKeyWindow : Form
@@ -761,10 +885,8 @@ $script:StatusBarColors = @{}   # parsed Color objects, populated by Initialize-
 $script:StatusBarFlow = $null   # FlowLayoutPanel holding the workspace labels, repositioned for alignment
 $script:StatusBarClockLabel = $null   # top-of-screen clock label (only when HideTaskbar + StatusBarShowClock)
 $script:StatusBarBatteryLabel = $null # top-of-screen battery % label (only when a battery is present)
-$script:StatusBarWifiLabel = $null    # wifi signal % label
-$script:StatusBarWifiIcon = $null     # wifi icon label, drawn just left of the % label
-$script:WifiForm = $null              # clickable host for the wifi labels (opens Wi-Fi settings)
-$script:WifiWidgetShown = $false
+$script:WifiWidget = $null   # clickable wifi icon + signal % (opens Wi-Fi settings)
+$script:AudioWidget = $null  # clickable speaker icon + volume % + mic icon (opens Sound settings)
 $script:NextWifiPoll = [datetime]::MinValue
 $script:PowerMenuForm = $null   # separate interactive form for the top-left power button
 $script:PowerMenu = $null
@@ -1588,52 +1710,19 @@ function Initialize-StatusBar {
         $script:StatusBarBatteryLabel = $battery
     }
 
-    $script:StatusBarWifiLabel = $null
-    $script:StatusBarWifiIcon = $null
-    $script:WifiForm = $null
+    $script:WifiWidget = $null
     if ($script:Config.StatusBarShowWifi) {
-        # Own form because the bar itself is click-through (WS_EX_TRANSPARENT), like the power button.
-        $wifiForm = New-Object System.Windows.Forms.Form
-        $wifiForm.FormBorderStyle = 'None'
-        $wifiForm.StartPosition = 'Manual'
-        $wifiForm.ShowInTaskbar = $false
-        $wifiForm.TopMost = $true
-        $wifiForm.BackColor = $script:StatusBarColors.Busy
-        $wifiForm.Cursor = [System.Windows.Forms.Cursors]::Hand
+        $script:WifiWidget = New-StatusBarClickWidget -SettingsUri 'ms-settings:network-wifi'
+        [void](Add-StatusBarWidgetLabel -Widget $script:WifiWidget -Icon)
+        [void](Add-StatusBarWidgetLabel -Widget $script:WifiWidget)
+    }
 
-        $wifi = New-Object System.Windows.Forms.Label
-        $wifi.AutoSize = $true
-        $wifi.Padding = [System.Windows.Forms.Padding]::new(2, 4, 8, 4)
-        $wifi.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 9
-        $wifi.ForeColor = $script:StatusBarColors.Text
-        $wifi.BackColor = $script:StatusBarColors.Busy
-        $wifiForm.Controls.Add($wifi)
-        $script:StatusBarWifiLabel = $wifi
-
-        # Separate label because the icon needs the icon font; height follows the text label.
-        $icon = New-Object System.Windows.Forms.Label
-        $icon.AutoSize = $false
-        $icon.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe MDL2 Assets', 10
-        $icon.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-        $icon.ForeColor = $script:StatusBarColors.Text
-        $icon.BackColor = $script:StatusBarColors.Busy
-        $icon.Text = [string][char]0xE701
-        $icon.Width = [System.Windows.Forms.TextRenderer]::MeasureText($icon.Text, $icon.Font).Width + 4
-        $wifiForm.Controls.Add($icon)
-        $script:StatusBarWifiIcon = $icon
-
-        $openWifiSettings = {
-            try { Start-Process 'ms-settings:network-wifi' } catch { Write-Log "Opening wifi settings failed: $_" }
-        }
-        $wifiForm.add_Click($openWifiSettings)
-        $wifi.add_Click($openWifiSettings)
-        $icon.add_Click($openWifiSettings)
-
-        [void]$wifiForm.Handle
-        $exStyle = [Win32]::GetWindowLong($wifiForm.Handle, -20)
-        $exStyle = $exStyle -bor 0x08000000 -bor 0x00000080 # WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
-        [Win32]::SetWindowLong($wifiForm.Handle, -20, $exStyle) | Out-Null
-        $script:WifiForm = $wifiForm
+    $script:AudioWidget = $null
+    if ($script:Config.StatusBarShowAudio) {
+        $script:AudioWidget = New-StatusBarClickWidget -SettingsUri 'ms-settings:sound'
+        [void](Add-StatusBarWidgetLabel -Widget $script:AudioWidget -Icon)
+        [void](Add-StatusBarWidgetLabel -Widget $script:AudioWidget)
+        [void](Add-StatusBarWidgetLabel -Widget $script:AudioWidget -Icon -Centered)
     }
 
     Update-StatusBarClock
@@ -1642,7 +1731,73 @@ function Initialize-StatusBar {
 
     $form.Show()
     Update-StatusBarWifi
+    Update-StatusBarAudio
     Update-StatusBarRightWidgets
+}
+
+function New-StatusBarClickWidget {
+    # Own form because the bar itself is click-through (WS_EX_TRANSPARENT), like the power button.
+    param([string]$SettingsUri)
+    $form = New-Object System.Windows.Forms.Form
+    $form.FormBorderStyle = 'None'
+    $form.StartPosition = 'Manual'
+    $form.ShowInTaskbar = $false
+    $form.TopMost = $true
+    $form.BackColor = $script:StatusBarColors.Busy
+    $form.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $form.Tag = $SettingsUri
+    $form.add_Click($script:OpenWidgetSettings)
+
+    [void]$form.Handle
+    $exStyle = [Win32]::GetWindowLong($form.Handle, -20)
+    $exStyle = $exStyle -bor 0x08000000 -bor 0x00000080 # WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+    [Win32]::SetWindowLong($form.Handle, -20, $exStyle) | Out-Null
+
+    return [PSCustomObject]@{
+        Form   = $form
+        Labels = New-Object 'System.Collections.Generic.List[System.Windows.Forms.Label]' # left to right
+        Shown  = $false
+    }
+}
+
+function Add-StatusBarWidgetLabel {
+    # Icons need the icon font, so they get their own label; their height follows the text labels.
+    param($Widget, [switch]$Icon, [switch]$Centered)
+    $label = New-Object System.Windows.Forms.Label
+    $label.ForeColor = $script:StatusBarColors.Text
+    $label.BackColor = $script:StatusBarColors.Busy
+    if ($Icon) {
+        $label.AutoSize = $false
+        $label.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe MDL2 Assets', 10
+        $label.Text = [string][char]0xE701 # MDL2 glyphs share one advance width, so any will do for sizing
+        $glyphWidth = [System.Windows.Forms.TextRenderer]::MeasureText($label.Text, $label.Font).Width
+        if ($Centered) {
+            $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+            $label.Width = $glyphWidth + 12
+        } else {
+            $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+            $label.Width = $glyphWidth + 4
+        }
+    } else {
+        $label.AutoSize = $true
+        $label.Padding = [System.Windows.Forms.Padding]::new(2, 4, 8, 4)
+        $label.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 9
+    }
+    $label.add_Click($script:OpenWidgetSettings)
+    $Widget.Form.Controls.Add($label)
+    $Widget.Labels.Add($label)
+    return $label
+}
+
+$script:OpenWidgetSettings = {
+    param($s, $e)
+    try { Start-Process ([string]$s.FindForm().Tag) } catch { Write-Log "Opening settings failed: $_" }
+}
+
+function Hide-StatusBarClickWidget {
+    param($Widget)
+    $Widget.Shown = $false
+    if ($Widget.Form.Visible) { $Widget.Form.Hide() }
 }
 
 function Test-HasBattery {
@@ -1673,17 +1828,16 @@ function Update-StatusBarBattery {
 }
 
 function Update-StatusBarWifi {
-    $label = $script:StatusBarWifiLabel
-    $icon = $script:StatusBarWifiIcon
-    if (-not $label -or $label.IsDisposed) { return }
+    $widget = $script:WifiWidget
+    if (-not $widget -or $widget.Form.IsDisposed) { return }
+    $icon, $label = $widget.Labels
     $now = [datetime]::UtcNow
     if ($now -lt $script:NextWifiPoll) { return }
     $script:NextWifiPoll = $now.AddMilliseconds([int]$script:Config.StatusBarWifiPollMs)
 
     $info = [WifiStatus]::Query()
     if (-not $info.HasAdapter) {
-        $script:WifiWidgetShown = $false
-        if ($script:WifiForm.Visible) { $script:WifiForm.Hide() }
+        Hide-StatusBarClickWidget -Widget $widget
         return
     }
 
@@ -1703,8 +1857,40 @@ function Update-StatusBarWifi {
     $label.ForeColor = $color
     $icon.Text = [string][char]$glyph
     $icon.ForeColor = $color
-    $icon.Height = $label.Height
-    $script:WifiWidgetShown = $true
+    $script:WifiWidget.Shown = $true
+}
+
+function Update-StatusBarAudio {
+    $widget = $script:AudioWidget
+    if (-not $widget -or $widget.Form.IsDisposed) { return }
+    $info = [AudioStatus]::Query()
+    if (-not $info.HasSpeaker -and -not $info.HasMic) {
+        Hide-StatusBarClickWidget -Widget $widget
+        return
+    }
+    $speakerIcon, $speakerText, $micIcon = $widget.Labels
+    $textColor = $script:StatusBarColors.Text
+    $dimColor = $script:StatusBarColors.IdleText
+
+    if (-not $info.HasSpeaker) {
+        $speakerGlyph = 0xE74F; $speakerLabel = 'none'; $speakerColor = $dimColor
+    } else {
+        $vol = [Math]::Max(0, [Math]::Min(100, $info.SpeakerVolume))
+        # Segoe MDL2 Assets speaker: crossed out when muted, else 0-3 sound waves.
+        $speakerGlyph = if ($info.SpeakerMuted) { 0xE74F } elseif ($vol -eq 0) { 0xE992 } elseif ($vol -le 33) { 0xE993 } elseif ($vol -le 66) { 0xE994 } else { 0xE995 }
+        $speakerLabel = "$vol%"
+        $speakerColor = if ($info.SpeakerMuted) { $dimColor } else { $textColor }
+    }
+    $speakerIcon.Text = [string][char]$speakerGlyph
+    $speakerIcon.ForeColor = $speakerColor
+    $speakerText.Text = $speakerLabel
+    $speakerText.ForeColor = $speakerColor
+
+    # Slashed mic when muted or when there's no input device at all.
+    $micOn = $info.HasMic -and -not $info.MicMuted
+    $micIcon.Text = [string][char]$(if ($micOn) { 0xE720 } else { 0xF781 })
+    $micIcon.ForeColor = if ($micOn) { $textColor } else { $dimColor }
+    $widget.Shown = $true
 }
 
 function Update-StatusBarRightWidgets {
@@ -1722,20 +1908,26 @@ function Update-StatusBarRightWidgets {
         $x -= 12
     }
 
-    $wifiForm = $script:WifiForm
-    if (-not $wifiForm -or $wifiForm.IsDisposed -or -not $script:WifiWidgetShown) { return }
-    $icon = $script:StatusBarWifiIcon
-    $label = $script:StatusBarWifiLabel
-    $width = $icon.Width + $label.Width
-    # Clipped to the bar's height, the same way the clock/battery labels are.
-    $height = [Math]::Min($label.Height, $form.ClientSize.Height)
-    $x -= $width
-    $y = [Math]::Max(0, [int](($form.ClientSize.Height - $label.Height) / 2))
-    $icon.Location = [System.Drawing.Point]::new(0, 0)
-    $label.Location = [System.Drawing.Point]::new($icon.Width, 0)
-    $bounds = [System.Drawing.Rectangle]::new($form.Left + [Math]::Max(0, $x), $form.Top + $y, $width, $height)
-    if ($wifiForm.Bounds -ne $bounds) { $wifiForm.Bounds = $bounds }
-    if (-not $wifiForm.Visible) { $wifiForm.Show() }
+    # Clickable widgets continue leftwards: wifi, then audio.
+    foreach ($widget in @($script:WifiWidget, $script:AudioWidget)) {
+        if (-not $widget -or $widget.Form.IsDisposed -or -not $widget.Shown) { continue }
+        $textHeight = 0
+        foreach ($l in $widget.Labels) { if ($l.AutoSize) { $textHeight = [Math]::Max($textHeight, $l.Height) } }
+        $lx = 0
+        foreach ($l in $widget.Labels) {
+            if (-not $l.AutoSize) { $l.Height = $textHeight }
+            $l.Location = [System.Drawing.Point]::new($lx, 0)
+            $lx += $l.Width
+        }
+        # Clipped to the bar's height, the same way the clock/battery labels are.
+        $height = [Math]::Min($textHeight, $form.ClientSize.Height)
+        $x -= $lx
+        $y = [Math]::Max(0, [int](($form.ClientSize.Height - $textHeight) / 2))
+        $bounds = [System.Drawing.Rectangle]::new($form.Left + [Math]::Max(0, $x), $form.Top + $y, $lx, $height)
+        if ($widget.Form.Bounds -ne $bounds) { $widget.Form.Bounds = $bounds }
+        if (-not $widget.Form.Visible) { $widget.Form.Show() }
+        $x -= 12
+    }
 }
 
 function Update-StatusBarAlignment {
@@ -1986,7 +2178,7 @@ $timer.Interval = [int]$script:Config.PollIntervalMs
 # loop and silently kill the whole app - keep the WM alive and log it instead.
 $timer.add_Tick({
     try {
-        Update-WindowSets; Update-StatusBarContent; Update-StatusBarClock; Update-StatusBarBattery; Update-StatusBarWifi; Update-StatusBarRightWidgets
+        Update-WindowSets; Update-StatusBarContent; Update-StatusBarClock; Update-StatusBarBattery; Update-StatusBarWifi; Update-StatusBarAudio; Update-StatusBarRightWidgets
     } catch { Write-Log "Update-WindowSets failed: $_" }
 })
 
@@ -2060,10 +2252,13 @@ try {
     if ($script:PowerMenuDismissTimer) { $script:PowerMenuDismissTimer.Stop(); $script:PowerMenuDismissTimer.Dispose() }
     if ($script:PowerMenu -and -not $script:PowerMenu.IsDisposed) { $script:PowerMenu.Dispose() }
     if ($script:PowerMenuForm -and -not $script:PowerMenuForm.IsDisposed) { $script:PowerMenuForm.Dispose() }
-    if ($script:WifiForm -and -not $script:WifiForm.IsDisposed) { $script:WifiForm.Dispose() }
+    foreach ($widget in @($script:WifiWidget, $script:AudioWidget)) {
+        if ($widget -and -not $widget.Form.IsDisposed) { $widget.Form.Dispose() }
+    }
     Stop-AppLauncher
     if (-not $hotkeyWindow.IsDisposed) { $hotkeyWindow.Dispose() }
     try { [WifiStatus]::Close() } catch { }
+    try { [AudioStatus]::Close() } catch { }
     try { $script:InstanceMutex.ReleaseMutex() } catch { }
     $script:InstanceMutex.Dispose()
     Close-LogWriter
