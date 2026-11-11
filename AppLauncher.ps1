@@ -121,6 +121,21 @@ public static class LauncherNative
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
     [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int dwProcessId);
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(System.Drawing.Point pt, uint dwFlags);
+    [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
+
+    public static int GetDpiAt(System.Drawing.Point pt)
+    {
+        try
+        {
+            uint x, y;
+            IntPtr mon = MonitorFromPoint(pt, 2); // MONITOR_DEFAULTTONEAREST
+            if (GetDpiForMonitor(mon, 0, out x, out y) == 0 && x > 0) return (int)x; // MDT_EFFECTIVE_DPI
+        }
+        catch (DllNotFoundException) { }
+        catch (EntryPointNotFoundException) { }
+        return 96;
+    }
 
     // Receiving WM_HOTKEY normally grants this process the right to take the foreground,
     // so plain SetForegroundWindow is tried first. Attaching to the current foreground
@@ -404,6 +419,8 @@ $script:Theme = @{
 }
 $script:Filtered = @()
 $script:ShownAt = [datetime]::MinValue
+$script:Scale = 1.0
+$script:CurrentDpi = 0
 
 $form = New-Object LauncherForm
 $form.Text = $script:WindowTitle
@@ -448,7 +465,8 @@ $listBox.add_DrawItem({
             $format.LineAlignment = [System.Drawing.StringAlignment]::Center
             $format.Trimming = [System.Drawing.StringTrimming]::EllipsisCharacter
             $format.FormatFlags = [System.Drawing.StringFormatFlags]::NoWrap
-            $rect = [System.Drawing.RectangleF]::new($e.Bounds.X + 8, $e.Bounds.Y, $e.Bounds.Width - 8, $e.Bounds.Height)
+            $inset = 8 * $script:Scale
+            $rect = [System.Drawing.RectangleF]::new($e.Bounds.X + $inset, $e.Bounds.Y, $e.Bounds.Width - $inset, $e.Bounds.Height)
             $e.Graphics.DrawString([string]$sender.Items[$e.Index], $e.Font, $textBrush, $rect, $format)
             $textBrush.Dispose()
             $format.Dispose()
@@ -518,12 +536,33 @@ $script:DismissTimer = New-Object System.Windows.Forms.Timer
 $script:DismissTimer.Interval = 100
 $script:DismissTimer.add_Tick({ try { Test-LauncherDismiss } catch { Write-Log "Dismiss check failed: $_" } })
 
+# The process is per-monitor DPI aware, so WinForms won't scale anything itself - fonts are
+# built in pixels for the target monitor's DPI and the window is sized from its work area.
+function Set-LauncherScale {
+    param([int]$Dpi)
+    if ($Dpi -eq $script:CurrentDpi) { return }
+    $script:CurrentDpi = $Dpi
+    $script:Scale = $Dpi / 96.0
+    $oldText = $script:TextBox.Font
+    $oldList = $script:ListBox.Font
+    $script:TextBox.Font = New-Object System.Drawing.Font('Segoe UI', [float](14 * $Dpi / 72.0), [System.Drawing.GraphicsUnit]::Pixel)
+    $script:ListBox.Font = New-Object System.Drawing.Font('Segoe UI', [float](11 * $Dpi / 72.0), [System.Drawing.GraphicsUnit]::Pixel)
+    $script:ListBox.ItemHeight = [Math]::Min(255, $script:ListBox.Font.Height + [int](8 * $script:Scale))
+    $script:Form.Padding = New-Object System.Windows.Forms.Padding([Math]::Max(1, [int][Math]::Round($script:Scale)))
+    $oldText.Dispose()
+    $oldList.Dispose()
+}
+
 function Show-Launcher {
-    $screen = [System.Windows.Forms.Screen]::FromPoint([System.Windows.Forms.Cursor]::Position)
-    $area = $screen.Bounds
-    $script:Form.Location = New-Object System.Drawing.Point(
-        ($area.X + [int](($area.Width - $script:Form.Width) / 2)),
-        ($area.Y + [int](($area.Height - $script:Form.Height) / 3)))
+    $cursor = [System.Windows.Forms.Cursor]::Position
+    $area = [System.Windows.Forms.Screen]::FromPoint($cursor).WorkingArea
+    Set-LauncherScale -Dpi ([LauncherNative]::GetDpiAt($cursor))
+    $width = [int][Math]::Min($area.Width * 0.9, [Math]::Max(560 * $script:Scale, $area.Width * 0.3))
+    $height = [int][Math]::Min($area.Height * 0.8, [Math]::Max(380 * $script:Scale, $area.Height * 0.4))
+    $script:Form.Bounds = New-Object System.Drawing.Rectangle(
+        ($area.X + [int](($area.Width - $width) / 2)),
+        ($area.Y + [int](($area.Height - $height) / 3)),
+        $width, $height)
     $script:TextBox.Text = ''
     Update-Results
     $script:ShownAt = Get-Date

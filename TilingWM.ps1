@@ -1183,7 +1183,9 @@ function Update-WindowSets {
         }
         # Track workspace membership for any real window, even ones excluded from tiling
         # (floating/other-workspace), so hide/show on workspace switch still works for them.
-        if (-not $script:WindowWorkspace.ContainsKey($hwnd) -and [Win32]::IsWindowVisible($hwnd) -and [Win32]::GetWindowTextLength($hwnd) -gt 0) {
+        # The launcher manages its own visibility - tagging it would make Switch-Workspace re-show it.
+        if (-not $script:WindowWorkspace.ContainsKey($hwnd) -and [Win32]::IsWindowVisible($hwnd) -and [Win32]::GetWindowTextLength($hwnd) -gt 0 -and
+            [Win32]::GetTitle($hwnd) -ne $script:AppLauncherWindowTitle) {
             $script:WindowWorkspace[$hwnd] = $script:ActiveWorkspace
         }
         # Some apps (e.g. Outlook reminder popups) re-show their own window on a timer,
@@ -1631,8 +1633,13 @@ function Initialize-StatusBar {
     $probe.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 9
     $probe.Text = '0'
     $height = [Math]::Max([int]$script:Config.StatusBarHeight, $probe.PreferredHeight + 4)
+    $g = $probe.CreateGraphics()
+    $script:StatusBarGap = [int][Math]::Round(6 * $g.DpiX / 96)
+    $g.Dispose()
     $probe.Dispose()
     $script:Config.StatusBarHeight = $height
+    # Every item gets the same 2px top/bottom inset as the power button, so all boxes line up.
+    $script:StatusBarItemSize = [System.Drawing.Size]::new(0, $height - 4)
 
     $script:StatusBarColors = @{
         Background = ConvertTo-BarColor $script:Config.StatusBarBackColor ([System.Drawing.Color]::FromArgb(24, 24, 24))
@@ -1671,6 +1678,9 @@ function Initialize-StatusBar {
         $label = New-Object System.Windows.Forms.Label
         $label.AutoSize = $true
         $label.Padding = [System.Windows.Forms.Padding]::new(8, 4, 8, 4)
+        $label.Margin = [System.Windows.Forms.Padding]::new(0, 0, $script:StatusBarGap, 0)
+        $label.MinimumSize = $script:StatusBarItemSize
+        $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
         $label.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 9
         $label.ForeColor = $script:StatusBarColors.IdleText
         $label.BackColor = $bg
@@ -1699,6 +1709,8 @@ function Initialize-StatusBar {
         $clock = New-Object System.Windows.Forms.Label
         $clock.AutoSize = $true
         $clock.Padding = [System.Windows.Forms.Padding]::new(8, 4, 8, 4)
+        $clock.MinimumSize = $script:StatusBarItemSize
+        $clock.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
         $clock.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 9
         $clock.ForeColor = $script:StatusBarColors.Text
         $clock.BackColor = $script:StatusBarColors.Busy
@@ -1713,6 +1725,8 @@ function Initialize-StatusBar {
         $battery = New-Object System.Windows.Forms.Label
         $battery.AutoSize = $true
         $battery.Padding = [System.Windows.Forms.Padding]::new(8, 4, 8, 4)
+        $battery.MinimumSize = $script:StatusBarItemSize
+        $battery.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
         $battery.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 9
         $battery.ForeColor = $script:StatusBarColors.Text
         $battery.BackColor = $script:StatusBarColors.Busy
@@ -1732,7 +1746,7 @@ function Initialize-StatusBar {
         $script:AudioWidget = New-StatusBarClickWidget -SettingsUri 'ms-settings:sound'
         [void](Add-StatusBarWidgetLabel -Widget $script:AudioWidget -Icon)
         [void](Add-StatusBarWidgetLabel -Widget $script:AudioWidget)
-        [void](Add-StatusBarWidgetLabel -Widget $script:AudioWidget -Icon -Centered)
+        [void](Add-StatusBarWidgetLabel -Widget $script:AudioWidget -Icon -Trailing)
     }
 
     Update-StatusBarClock
@@ -1772,25 +1786,23 @@ function New-StatusBarClickWidget {
 
 function Add-StatusBarWidgetLabel {
     # Icons need the icon font, so they get their own label; their height follows the text labels.
-    param($Widget, [switch]$Icon, [switch]$Centered)
+    # Outer edges get the same 8px padding as the other bar items; icon-to-text gaps are 2px.
+    param($Widget, [switch]$Icon, [switch]$Trailing)
     $label = New-Object System.Windows.Forms.Label
     $label.ForeColor = $script:StatusBarColors.Text
     $label.BackColor = $script:StatusBarColors.Busy
+    $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
     if ($Icon) {
         $label.AutoSize = $false
         $label.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe MDL2 Assets', 10
         $label.Text = [string][char]0xE701 # MDL2 glyphs share one advance width, so any will do for sizing
         $glyphWidth = [System.Windows.Forms.TextRenderer]::MeasureText($label.Text, $label.Font).Width
-        if ($Centered) {
-            $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
-            $label.Width = $glyphWidth + 12
-        } else {
-            $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-            $label.Width = $glyphWidth + 4
-        }
+        $label.Padding = if ($Trailing) { [System.Windows.Forms.Padding]::new(0, 0, 8, 0) } else { [System.Windows.Forms.Padding]::new(8, 0, 2, 0) }
+        $label.Width = $glyphWidth + $label.Padding.Horizontal
     } else {
         $label.AutoSize = $true
         $label.Padding = [System.Windows.Forms.Padding]::new(2, 4, 8, 4)
+        $label.MinimumSize = $script:StatusBarItemSize
         $label.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 9
     }
     $label.add_Click($script:OpenWidgetSettings)
@@ -1909,13 +1921,14 @@ function Update-StatusBarRightWidgets {
     # right regardless of the workspace slots' own alignment setting.
     $form = $script:StatusBarForm
     if (-not $form -or $form.IsDisposed) { return }
-    $x = $form.ClientSize.Width - 12
+    # Flush right, mirroring the power button flush left.
+    $x = $form.ClientSize.Width
     foreach ($label in @($script:StatusBarClockLabel, $script:StatusBarBatteryLabel)) {
         if (-not $label -or $label.IsDisposed) { continue }
         $x -= $label.Width
         $y = [int](($form.ClientSize.Height - $label.Height) / 2)
         $label.Location = [System.Drawing.Point]::new([Math]::Max(0, $x), [Math]::Max(0, $y))
-        $x -= 12
+        $x -= $script:StatusBarGap
     }
 
     # Clickable widgets continue leftwards: wifi, then audio.
@@ -1936,7 +1949,7 @@ function Update-StatusBarRightWidgets {
         $bounds = [System.Drawing.Rectangle]::new($form.Left + [Math]::Max(0, $x), $form.Top + $y, $lx, $height)
         if ($widget.Form.Bounds -ne $bounds) { $widget.Form.Bounds = $bounds }
         if (-not $widget.Form.Visible) { $widget.Form.Show() }
-        $x -= 12
+        $x -= $script:StatusBarGap
     }
 }
 
@@ -1947,10 +1960,12 @@ function Update-StatusBarAlignment {
     $flow = $script:StatusBarFlow
     $form = $script:StatusBarForm
     $flow.PerformLayout()
+    # Each label carries a trailing gap as its right margin; don't count the last one.
+    $contentWidth = $flow.Width - $script:StatusBarGap
     $x = switch ($script:Config.StatusBarAlignment) {
-        'Center' { [int](($form.ClientSize.Width - $flow.Width) / 2) }
-        'Right' { $form.ClientSize.Width - $flow.Width }
-        default { if ($script:PowerMenuForm) { $script:PowerMenuForm.Width + 8 } else { 0 } }
+        'Center' { [int](($form.ClientSize.Width - $contentWidth) / 2) }
+        'Right' { $form.ClientSize.Width - $contentWidth }
+        default { if ($script:PowerMenuForm) { $script:PowerMenuForm.Width + $script:StatusBarGap } else { 0 } }
     }
     $y = [int](($form.ClientSize.Height - $flow.Height) / 2)
     $flow.Location = [System.Drawing.Point]::new([Math]::Max(0, $x), [Math]::Max(0, $y))
