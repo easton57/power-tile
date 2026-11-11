@@ -872,8 +872,7 @@ $script:FloatingWindows = New-Object 'System.Collections.Generic.HashSet[IntPtr]
 $script:HotKeyActions = @{}     # hotkey id -> action name
 $script:HotKeyWindowHandle = [IntPtr]::Zero
 $script:WindowWorkspace = @{}   # hwnd -> workspace number, remembered even while hidden
-$script:LastWindowVisible = @{} # hwnd -> was it visible on the previous poll (Outlook dismiss-detection)
-$script:DismissedWindows = New-Object 'System.Collections.Generic.HashSet[IntPtr]' # Outlook singleton popups the user closed - never re-show
+$script:LastWindowVisible = @{} # hwnd -> was it visible on the previous poll (detects apps hiding their own windows)
 $script:ActiveWorkspace = 1
 $script:WorkspaceMasterRatio = @{} # "workspace|MonitorKey" -> master ratio override, falls back to Config.MasterRatio
 $script:LastMousePos = $null # last-seen cursor position, so focus-follows-mouse only reacts to actual movement
@@ -1143,7 +1142,7 @@ function Update-WindowSets {
     $allHwnds = [Win32]::GetTopLevelWindows()
     # For the stale-entry purges below; -notcontains on the raw list was a linear scan per entry.
     $allHwndSet = [System.Collections.Generic.HashSet[IntPtr]]::new($allHwnds)
-    $tracked = [System.Collections.Generic.HashSet[IntPtr]]::new($script:DismissedWindows)
+    $tracked = [System.Collections.Generic.HashSet[IntPtr]]::new()
     foreach ($h in $script:WindowWorkspace.Keys) { [void]$tracked.Add($h) }
     $byMonitor = @{}
 
@@ -1159,27 +1158,19 @@ function Update-WindowSets {
             [Win32]::ShowWindow($hwnd, 0) | Out-Null # SW_HIDE
             continue
         }
-        # Outlook's reminder dialog (#32770) and Inspector windows (rctrl_renwnd32 - a compose
-        # or read window) are singleton-ish: Outlook just hides the hwnd instead of destroying it
-        # when the user dismisses/closes it. Without this, Switch-Workspace's own "show windows
-        # tagged to this workspace" logic re-shows that very same hwnd next time the user returns
-        # to this workspace, making a dismissed reminder/compose window look like it "reopens
-        # itself". Detect the visible -> hidden transition happening on its own (i.e. not because
-        # *we* just hid it for an outgoing workspace) and stop showing that window for good.
-        # Hash lookup first - rules out nearly every window before the class-name call.
-        $isOutlookSingleton = $script:WindowWorkspace.ContainsKey($hwnd) -and $script:WindowWorkspace[$hwnd] -eq $script:ActiveWorkspace -and
-            (@('#32770', 'rctrl_renwnd32') -contains [Win32]::GetClass($hwnd))
-        if ($isOutlookSingleton) {
-            $isOutlookProc = [Win32]::GetProcessName($hwnd) -eq 'OUTLOOK'
+        # Many apps "close" a window by hiding it and later re-show the same hwnd - Outlook's
+        # reminder dialog and Inspector windows, tray apps like Teams. Only we hide windows on the
+        # active workspace's behalf when leaving it, so a visible -> hidden transition here was the
+        # app's own doing: forget the window. That stops Switch-Workspace re-showing it, and its next
+        # appearance (e.g. the next meeting reminder) gets tagged fresh to whichever workspace is active.
+        if ($script:WindowWorkspace.ContainsKey($hwnd) -and $script:WindowWorkspace[$hwnd] -eq $script:ActiveWorkspace) {
             $visibleNow = [Win32]::IsWindowVisible($hwnd)
-            if ($isOutlookProc -and $script:LastWindowVisible.ContainsKey($hwnd) -and $script:LastWindowVisible[$hwnd] -and -not $visibleNow) {
-                [void]$script:DismissedWindows.Add($hwnd)
+            if ($script:LastWindowVisible[$hwnd] -and -not $visibleNow) {
+                $script:WindowWorkspace.Remove($hwnd)
+                $script:LastWindowVisible.Remove($hwnd)
+                continue
             }
             $script:LastWindowVisible[$hwnd] = $visibleNow
-        }
-        if ($script:DismissedWindows.Contains($hwnd)) {
-            if ([Win32]::IsWindowVisible($hwnd)) { [Win32]::ShowWindow($hwnd, 0) | Out-Null } # SW_HIDE
-            continue
         }
         # Track workspace membership for any real window, even ones excluded from tiling
         # (floating/other-workspace), so hide/show on workspace switch still works for them.
@@ -1209,14 +1200,9 @@ function Update-WindowSets {
     foreach ($hwnd in @($script:WindowWorkspace.Keys)) {
         if (-not $allHwndSet.Contains($hwnd)) { $script:WindowWorkspace.Remove($hwnd) }
     }
-    # Purge bookkeeping for any hwnd that's been fully destroyed, not just hidden, so a genuinely
-    # new window (a fresh Outlook reminder/compose instance reusing a recycled-looking title) isn't
-    # mistaken for one already marked dismissed, and these dictionaries don't grow unbounded.
+    # Purge bookkeeping for any hwnd that's been fully destroyed so the table doesn't grow unbounded.
     foreach ($hwnd in @($script:LastWindowVisible.Keys)) {
         if (-not $allHwndSet.Contains($hwnd)) { $script:LastWindowVisible.Remove($hwnd) }
-    }
-    foreach ($hwnd in @($script:DismissedWindows)) {
-        if (-not $allHwndSet.Contains($hwnd)) { [void]$script:DismissedWindows.Remove($hwnd) }
     }
 
     $changed = $Force.IsPresent
@@ -2067,7 +2053,7 @@ function Switch-Workspace {
             # we're leaving the workspace it happens to be tagged to - see Test-AlwaysVisibleWindow.
             if (Test-AlwaysVisibleWindow -Hwnd $hwnd) { continue }
             [Win32]::ShowWindow($hwnd, 0) | Out-Null # SW_HIDE
-        } elseif ($ws -eq $Workspace -and -not $script:DismissedWindows.Contains($hwnd)) {
+        } elseif ($ws -eq $Workspace) {
             [Win32]::ShowWindow($hwnd, 8) | Out-Null # SW_SHOWNA (no activation)
         }
     }
